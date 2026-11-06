@@ -19,10 +19,6 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .node-version
-          cache: npm
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update && rustup default stable
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -30,28 +26,52 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            src-tauri/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
-      - name: Check that the tag matches the app version
+      - name: Read the version
+        id: version
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)" >> "$GITHUB_OUTPUT"
+      - name: Check that the tag matches the version
         if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -n 1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match version $version in src-tauri/Cargo.toml"
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $VERSION in Cargo.toml"
             exit 1
           fi
-      - run: npm ci
-      - run: npm run check
-      - run: npx tauri build
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
         env:
           # A fork sets the APP_URL repository variable to build for its own instance.
           APP_URL: ${{ vars.APP_URL }}
-      - run: cp src-tauri/target/release/bundle/nsis/*-setup.exe BigRocketCampDirect-setup.exe
+      - name: Measure the collector for 20 seconds
+        shell: pwsh
+        run: |
+          $exe = Get-Item target/release/bigrocketcamp-collector.exe
+          "Executable: {0:N0} KB" -f ($exe.Length / 1KB)
+          $process = Start-Process -FilePath $exe.FullName -PassThru
+          Start-Sleep -Seconds 20
+          $process.Refresh()
+          if ($process.HasExited) { throw "The collector stopped by itself (exit code $($process.ExitCode))." }
+          "Working set: {0:N1} MB, private memory: {1:N1} MB, threads: {2}, CPU time: {3:N3} s" -f `
+            ($process.WorkingSet64 / 1MB), ($process.PrivateMemorySize64 / 1MB), $process.Threads.Count, $process.TotalProcessorTime.TotalSeconds
+          "Priority: {0}" -f $process.PriorityClass
+          Stop-Process -Id $process.Id
+      - name: Build the installer
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          makensis=$(command -v makensis || echo "/c/Program Files (x86)/NSIS/makensis.exe")
+          "$makensis" -DVERSION="$VERSION" -DOUTFILE="$PWD/BigRocketCampCollector-setup.exe" installer/collector.nsi
+          ls -l BigRocketCampCollector-setup.exe
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: installer
-          path: BigRocketCampDirect-setup.exe
+          path: BigRocketCampCollector-setup.exe
           if-no-files-found: error
 
   release:
@@ -67,4 +87,4 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" BigRocketCampDirect-setup.exe --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" BigRocketCampCollector-setup.exe --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
