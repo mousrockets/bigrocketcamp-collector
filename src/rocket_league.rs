@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn configures_once_with_a_backup() {
-        let install = std::env::temp_dir().join(format!("brc-direct-test-{}", std::process::id()));
+        let install = std::env::temp_dir().join(format!("brc-collector-test-{}", std::process::id()));
         let folder = install.join("TAGame").join("Config");
         fs::create_dir_all(&folder).unwrap();
         let file = folder.join("DefaultStatsAPI.ini");
