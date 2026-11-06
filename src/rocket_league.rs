@@ -5,6 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::status::Setup;
+
 /// The same values as the instructions on the /direct page of the web app.
 const SECTION: &str = "TAGame.MatchStatsExporter_TA";
 const SETTINGS: [(&str, &str); 3] = [("PacketSendRate", "10"), ("Port", "0"), ("WebPort", "49124")];
@@ -52,14 +54,34 @@ pub fn installs() -> Vec<PathBuf> {
     found
 }
 
+/// Sets up every Rocket League found; one ready installation is enough.
+pub fn set_up() -> Setup {
+    let installs = installs();
+    if installs.is_empty() {
+        return Setup::Problem("Rocket League introuvable dans Epic Games ou Steam.".into());
+    }
+    let mut problem = None;
+    let mut ready = false;
+    let mut changed = false;
+    for install in installs {
+        match configure(&install) {
+            Ok(Outcome::Updated(_)) => changed = true,
+            Ok(Outcome::AlreadySet) => ready = true,
+            Ok(Outcome::NoConfigFile) => problem = Some("Fichier de réglages du jeu introuvable.".to_owned()),
+            Err(error) => problem = Some(format!("Réglage du jeu impossible : {error}.")),
+        }
+    }
+    match (changed, ready, problem) {
+        (true, _, _) => Setup::Changed,
+        (false, true, _) | (false, false, None) => Setup::Ready,
+        (false, false, Some(problem)) => Setup::Problem(problem),
+    }
+}
+
 /// Sets the Stats API keys, keeping every other line, after a one-time backup of the original file.
 pub fn configure(install: &Path) -> Result<Outcome, SetupError> {
     let folder = install.join("TAGame").join("Config");
-    let Some(file) = CONFIG_FILES
-        .iter()
-        .map(|name| folder.join(name))
-        .find(|file| file.is_file())
-    else {
+    let Some(file) = CONFIG_FILES.iter().map(|name| folder.join(name)).find(|file| file.is_file()) else {
         return Ok(Outcome::NoConfigFile);
     };
     let bytes = fs::read(&file)?;
@@ -113,19 +135,13 @@ fn with_stats_api(text: &str) -> String {
             missing.retain(|(other, _)| other != name);
         }
     }
-    let last_setting = lines[header..end]
-        .iter()
-        .rposition(|line| !line.trim().is_empty())
-        .map_or(header, |offset| header + offset);
+    let last_setting =
+        lines[header..end].iter().rposition(|line| !line.trim().is_empty()).map_or(header, |offset| header + offset);
     let added: Vec<String> = missing.iter().map(|(key, value)| format!("{key}={value}")).collect();
     lines.splice(last_setting + 1..last_setting + 1, added);
 
     let joined = lines.join(newline);
-    if ends_with_newline {
-        format!("{bom}{joined}{newline}")
-    } else {
-        format!("{bom}{joined}")
-    }
+    if ends_with_newline { format!("{bom}{joined}{newline}") } else { format!("{bom}{joined}") }
 }
 
 fn is_header(line: &str, name: Option<&str>) -> bool {
@@ -147,10 +163,7 @@ fn epic_installs() -> Vec<PathBuf> {
     entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("item"))
-        })
+        .filter(|path| path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("item")))
         .filter_map(|path| fs::read_to_string(path).ok())
         .filter_map(|manifest| epic_install(&manifest))
         .collect()
@@ -164,9 +177,7 @@ fn epic_install(manifest: &str) -> Option<PathBuf> {
     if !is_rocket_league {
         return None;
     }
-    text("InstallLocation")
-        .filter(|location| !location.is_empty())
-        .map(PathBuf::from)
+    text("InstallLocation").filter(|location| !location.is_empty()).map(PathBuf::from)
 }
 
 fn steam_installs() -> Vec<PathBuf> {
@@ -188,13 +199,7 @@ fn steam_installs() -> Vec<PathBuf> {
 
 #[cfg(windows)]
 fn steam_folder() -> Option<PathBuf> {
-    let user = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-    let path: String = user
-        .open_subkey(r"Software\Valve\Steam")
-        .ok()?
-        .get_value("SteamPath")
-        .ok()?;
-    Some(PathBuf::from(path.replace('/', r"\")))
+    crate::win::steam_folder()
 }
 
 #[cfg(not(windows))]
@@ -250,10 +255,7 @@ mod tests {
     #[test]
     fn reads_steam_libraries() {
         let folders = "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"C:\\\\Program Files (x86)\\\\Steam\"\n\t}\n\t\"1\"\n\t{\n\t\t\"path\"\t\t\"D:\\\\Games\"\n\t}\n}\n";
-        assert_eq!(
-            vdf_values(folders, "path"),
-            [r"C:\Program Files (x86)\Steam", r"D:\Games"]
-        );
+        assert_eq!(vdf_values(folders, "path"), [r"C:\Program Files (x86)\Steam", r"D:\Games"]);
     }
 
     #[test]
@@ -261,10 +263,7 @@ mod tests {
         let rocket_league =
             r#"{"AppName":"Sugar","DisplayName":"Rocket League®","InstallLocation":"D:\\Epic\\rocketleague"}"#;
         let other = r#"{"AppName":"Fortnite","DisplayName":"Fortnite","InstallLocation":"D:\\Epic\\Fortnite"}"#;
-        assert_eq!(
-            epic_install(rocket_league),
-            Some(PathBuf::from(r"D:\Epic\rocketleague"))
-        );
+        assert_eq!(epic_install(rocket_league), Some(PathBuf::from(r"D:\Epic\rocketleague")));
         assert_eq!(epic_install(other), None);
     }
 
@@ -278,10 +277,7 @@ mod tests {
         fs::write(&file, original).unwrap();
 
         assert_eq!(configure(&install).unwrap(), Outcome::Updated(file.clone()));
-        assert_eq!(
-            fs::read_to_string(folder.join("DefaultStatsAPI.ini.bak")).unwrap(),
-            original
-        );
+        assert_eq!(fs::read_to_string(folder.join("DefaultStatsAPI.ini.bak")).unwrap(), original);
         assert_eq!(configure(&install).unwrap(), Outcome::AlreadySet);
 
         fs::remove_dir_all(&install).unwrap();
