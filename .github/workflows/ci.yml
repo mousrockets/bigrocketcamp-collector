@@ -1,4 +1,5 @@
-# Checks and builds the Windows installer on every push; a `v*` tag also publishes it in a release.
+# Checks and builds the Windows installer on every push; a `v*` tag also publishes it in a release,
+# with the SHA256SUMS the collector checks before installing an update.
 # Actions are pinned to a commit, not a tag, so that a moved tag can never change what runs here.
 name: CI
 
@@ -91,4 +92,8 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" BigRocketCampCollector-setup.exe --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+        # SHA256SUMS lets the collector check an update before running it.
+        run: |
+          sha256sum BigRocketCampCollector-setup.exe > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" BigRocketCampCollector-setup.exe SHA256SUMS --verify-tag --title "$GITHUB_REF_NAME" --generate-notes

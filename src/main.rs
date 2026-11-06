@@ -11,6 +11,7 @@ mod rocket_league;
 mod service;
 mod status;
 mod store;
+mod update;
 #[cfg(windows)]
 mod win;
 

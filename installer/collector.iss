@@ -47,6 +47,8 @@ Name: "{autoprograms}\{#Name}"; Filename: "{app}\{#Exe}"
 
 [Run]
 Filename: "{app}\{#Exe}"; Description: "{cm:LaunchProgram,{#Name}}"; Flags: nowait postinstall skipifsilent
+; An update started from the collector runs quietly, then brings the collector back.
+Filename: "{app}\{#Exe}"; Flags: nowait; Check: WizardSilent
 
 [Registry]
 ; The collector adds itself to the Windows startup list; uninstalling removes that entry.
@@ -65,13 +67,19 @@ const
 procedure CloseCollector();
 var
   Window: HWND;
+  Tries: Integer;
 begin
   Window := FindWindowByClassName('{#AppId}');
   if Window <> 0 then
-  begin
     SendMessage(Window, WM_QUIT_COLLECTOR, 0, 0);
-    Sleep(1000);
+  // An update quits by itself just after starting this installer: wait until it is gone, five seconds at most.
+  Tries := 0;
+  while (FindWindowByClassName('{#AppId}') <> 0) and (Tries < 20) do
+  begin
+    Sleep(250);
+    Tries := Tries + 1;
   end;
+  Sleep(500);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;

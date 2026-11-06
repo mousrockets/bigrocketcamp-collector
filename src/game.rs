@@ -22,13 +22,14 @@ pub fn now() -> i64 {
 }
 
 /// Runs for the life of the process: connects, reads until the game closes, then waits and tries again.
-pub fn listen(mut on_connection: impl FnMut(bool), mut on_match: impl FnMut(Value)) {
+/// `on_playing` tells when a match starts or stops being followed, so that an update can wait for its end.
+pub fn listen(mut on_connection: impl FnMut(bool), mut on_match: impl FnMut(Value), mut on_playing: impl FnMut(bool)) {
     let mut retry = FIRST_RETRY;
     loop {
         if let Some(mut socket) = connect() {
             retry = FIRST_RETRY;
             on_connection(true);
-            read(&mut socket, &mut on_match);
+            read(&mut socket, &mut on_match, &mut on_playing);
             on_connection(false);
         }
         sleep(retry);
@@ -47,10 +48,15 @@ fn connect() -> Option<WebSocket<TcpStream>> {
     })
 }
 
-fn read(socket: &mut WebSocket<TcpStream>, on_match: &mut impl FnMut(Value)) {
+fn read(socket: &mut WebSocket<TcpStream>, on_match: &mut impl FnMut(Value), on_playing: &mut impl FnMut(bool)) {
     let mut stream = StatsStream::default();
     let mut capture = MatchCapture::default();
+    let mut playing = false;
     loop {
+        if capture.in_match() != playing {
+            playing = !playing;
+            on_playing(playing);
+        }
         match socket.read() {
             Ok(Message::Text(text)) => match stream.push(text.as_str()) {
                 Ok(messages) => {
@@ -68,7 +74,12 @@ fn read(socket: &mut WebSocket<TcpStream>, on_match: &mut impl FnMut(Value)) {
                 capture.reset();
             }
             Ok(_) => {}
-            Err(_) => return,
+            Err(_) => {
+                if playing {
+                    on_playing(false);
+                }
+                return;
+            }
         }
     }
 }

@@ -1,19 +1,23 @@
-//! The two background threads (game and uploads) and the state they share with the window.
+//! The background threads (game, uploads, updates) and the state they share with the window.
 
 use crate::api::{Api, Pairing};
 use crate::bridge::{Event, Next, Queue};
 use crate::game;
-use crate::status::Status;
+use crate::status::{Status, Update};
 use crate::store::Settings;
+use crate::update::{Release, Updater};
 use serde_json::Value;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
 const RETRY: Duration = Duration::from_secs(10);
+const UPDATE_CHECK: Duration = Duration::from_secs(6 * 60 * 60);
+const UPDATE_CHECK_AFTER_FAILURE: Duration = Duration::from_secs(60 * 60);
 
 /// Where the token lives between launches; on Windows, encrypted for this user with DPAPI.
 pub trait Vault: Send + Sync {
@@ -35,6 +39,9 @@ pub struct Service {
     api: Api,
     notify: Box<dyn Fn() + Send + Sync>,
     commands: Mutex<Option<Sender<Command>>>,
+    updater: Updater,
+    release: Mutex<Option<Release>>,
+    toasts: AtomicU32,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -59,6 +66,9 @@ impl Service {
             api: Api::new(),
             notify,
             commands: Mutex::new(None),
+            updater: Updater::new(),
+            release: Mutex::new(None),
+            toasts: AtomicU32::new(0),
         })
     }
 
@@ -99,15 +109,35 @@ impl Service {
         let service = Arc::clone(self);
         thread::spawn(move || {
             game::listen(
-                |connected| service.update(|status| status.game_connected = connected),
+                |connected| {
+                    service.update(|status| status.game_connected = connected);
+                    if !connected {
+                        service.match_over();
+                    }
+                },
                 |payload| {
                     let _ = sender.send(Command::Match(payload));
+                },
+                |playing| {
+                    if playing {
+                        service.update(|status| status.in_match = true);
+                    } else {
+                        service.match_over();
+                    }
                 },
             );
         });
 
         let service = Arc::clone(self);
         thread::spawn(move || service.send_matches(Queue::load(queue_path, game::now()), receiver));
+
+        let service = Arc::clone(self);
+        thread::spawn(move || {
+            loop {
+                let reached = service.check_for_update(false);
+                thread::sleep(if reached { UPDATE_CHECK } else { UPDATE_CHECK_AFTER_FAILURE });
+            }
+        });
 
         if let Some(token) = lock(&self.token).clone() {
             let service = Arc::clone(self);
@@ -188,6 +218,78 @@ impl Service {
         });
     }
 
+    fn toast(&self, text: String) {
+        let id = self.toasts.fetch_add(1, Ordering::Relaxed) + 1;
+        self.update(|status| status.toast = Some((id, text)));
+    }
+
+    /// Asks GitHub for a newer release; true when GitHub answered.
+    fn check_for_update(&self, manual: bool) -> bool {
+        if manual {
+            self.update(|status| {
+                if !status.update.busy() {
+                    status.update = Update::Checking;
+                }
+            });
+        }
+        let answer = self.updater.check();
+        if let Some(Some(release)) = &answer {
+            *lock(&self.release) = Some(release.clone());
+        }
+        self.update(|status| {
+            if status.update.busy() {
+                return;
+            }
+            status.update = match (&answer, &status.update) {
+                (Some(Some(release)), _) => Update::Available(release.version.clone()),
+                (Some(None), _) if manual => Update::UpToDate,
+                (None, _) if manual => Update::CheckFailed,
+                (_, current) => current.clone(),
+            };
+        });
+        answer.is_some()
+    }
+
+    /// « Rechercher les mises à jour »: answers in the window.
+    pub fn check_now(self: &Arc<Self>) {
+        let service = Arc::clone(self);
+        thread::spawn(move || service.check_for_update(true));
+    }
+
+    /// « Mettre à jour »: now, or at the end of the match being played.
+    pub fn request_update(self: &Arc<Self>) {
+        let status = self.status();
+        let Some(version) = status.update.offer().map(str::to_owned) else { return };
+        if status.in_match {
+            self.update(|status| status.update = Update::AfterMatch(version));
+            self.toast("Mise à jour prévue à la fin du match.".into());
+        } else {
+            self.start_update();
+        }
+    }
+
+    /// The match ended, or the game closed: a waiting update can run.
+    fn match_over(self: &Arc<Self>) {
+        self.update(|status| status.in_match = false);
+        if matches!(self.status().update, Update::AfterMatch(_)) {
+            self.start_update();
+        }
+    }
+
+    fn start_update(self: &Arc<Self>) {
+        let Some(release) = lock(&self.release).clone() else { return };
+        self.update(|status| status.update = Update::Downloading(release.version.clone()));
+        self.toast(format!("Mise à jour vers la version {} en cours.", release.version));
+        let service = Arc::clone(self);
+        thread::spawn(move || {
+            let launched = service.updater.download(&release).ok().is_some_and(|installer| launch(&installer));
+            // Installing makes the window quit, so that the installer can replace the executable.
+            service.update(|status| {
+                status.update = if launched { Update::Installing } else { Update::Failed(release.version.clone()) }
+            });
+        });
+    }
+
     /// A typed code that cannot be right: told at once, without asking the API.
     pub fn wrong_code(&self) {
         self.update(|status| status.pairing_error = Some("Le code fait 8 lettres ou chiffres.".into()));
@@ -225,6 +327,12 @@ impl Service {
             });
         });
     }
+}
+
+/// Runs the per-user installer quietly; it restarts the collector when it is done.
+fn launch(installer: &std::path::Path) -> bool {
+    let quiet = std::process::Command::new(installer).args(["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]).spawn();
+    quiet.or_else(|_| std::process::Command::new(installer).spawn()).is_ok()
 }
 
 /// Codes are typed by hand: spaces, dashes and case do not matter.
