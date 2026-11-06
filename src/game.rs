@@ -75,6 +75,10 @@ fn read(socket: &mut WebSocket<TcpStream>, on_match: &mut impl FnMut(Value), on_
             }
             Ok(_) => {}
             Err(_) => {
+                // The game closed right after a match: its last known scoreboard still counts.
+                if let Some(payload) = capture.finish(now()) {
+                    on_match(payload);
+                }
                 if playing {
                     on_playing(false);
                 }

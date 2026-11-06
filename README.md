@@ -30,7 +30,7 @@ La pastille et l'icône changent de couleur :
 
 Un clic sur l'icône rouvre la fenêtre. Un clic droit propose : Ouvrir, Aide, Mettre à jour, Rechercher les mises à jour, Lancer au démarrage de Windows, Quitter.
 
-Attends le tableau final avant de quitter un match : sans lui, aucun résultat n'est envoyé.
+Un match compte dès que le jeu annonce le gagnant, forfait compris : les joueurs déjà partis ou remplacés par un bot ne figurent simplement pas dans le tableau envoyé. Si tu quittes avant la fin du match, aucun résultat n'est envoyé.
 
 ## Mises à jour
 
@@ -85,7 +85,11 @@ Content-Type: application/json
 {"state":{…},"end":{…},"startedAt":…,"endedAt":…,"seenIds":[…]}
 ```
 
-- Le corps est exactement celui que le pont web envoie aujourd'hui, champ pour champ et dans le même ordre (voir `src/capture.rs`, porté de `src/lib/live-stats.ts`).
+- Le corps garde le format du pont web, champ pour champ et dans le même ordre (voir `src/capture.rs`, porté de `src/lib/live-stats.ts`).
+- `state.Players` ne contient que les joueurs qui ont un identifiant valide : au moins un, au plus le nombre de joueurs de la playlist, et la moitié au plus par équipe. Les bots et les joueurs partis après un forfait en sont absents.
+- `seenIds` contient les identifiants de ces mêmes joueurs, dans l'ordre où le collecteur les a vus.
+- Le gagnant vient de `MatchEnded` : `Game.bHasWinner` vaut `true` et `Game.Winner` est le nom de l'équipe `WinnerTeamNum`.
+- Le collecteur envoie le tableau dès qu'il reçoit deux fois de suite le même après `MatchEnded`. Sinon, il envoie le dernier tableau connu du match quand le joueur le quitte, quand un autre match commence ou quand le jeu se ferme.
 - Sans cookie ni en-tête `Origin` : avec un jeton `Bearer`, la route ne doit pas exiger la même origine. Elle vérifie toujours que le tableau contient un identifiant de jeu du membre du jeton.
 - `200` : `{"ok":true,"match":"<MatchGuid sans espaces, en minuscules>"}`. Sans cette confirmation exacte, le match reste dans la file.
 - `400`, `403` (aucun joueur du membre dans le tableau) ou `413` : refus définitif, le match est retiré de la file.
