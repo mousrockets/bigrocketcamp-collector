@@ -1,5 +1,7 @@
 //! What the collector knows, and the one line the player sees: green, grey or red.
 
+use crate::update::current_version;
+
 /// The result of setting up Rocket League's Stats API at launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Setup {
@@ -20,6 +22,61 @@ pub struct Status {
     pub queued: usize,
     pub sending_problem: Option<String>,
     pub last_received: bool,
+    /// A match is being followed: an update waits for its end.
+    pub in_match: bool,
+    pub update: Update,
+    /// A Windows notification to show once, with an id that changes for each new one.
+    pub toast: Option<(u32, String)>,
+}
+
+/// Where the collector stands with its own updates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Update {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    CheckFailed,
+    Available(String),
+    AfterMatch(String),
+    Downloading(String),
+    Installing,
+    Failed(String),
+}
+
+impl Update {
+    /// The version the « Mettre à jour » button offers, when it is shown.
+    pub fn offer(&self) -> Option<&str> {
+        match self {
+            Self::Available(version) | Self::Failed(version) => Some(version),
+            _ => None,
+        }
+    }
+
+    /// An update is on its way: a check must not replace this state.
+    pub fn busy(&self) -> bool {
+        matches!(self, Self::AfterMatch(_) | Self::Downloading(_) | Self::Installing)
+    }
+
+    /// The small sign on the notification-area icon.
+    pub fn badge(&self) -> bool {
+        matches!(self, Self::Available(_) | Self::AfterMatch(_) | Self::Failed(_))
+    }
+
+    pub fn line(&self) -> String {
+        let current = current_version();
+        match self {
+            Self::Idle => format!("Version v{current}"),
+            Self::Checking => "Recherche des mises à jour…".into(),
+            Self::UpToDate => format!("À jour (v{current})"),
+            Self::CheckFailed => "Impossible de vérifier, réessaie plus tard".into(),
+            Self::Available(version) => format!("Nouvelle version v{version} disponible"),
+            Self::AfterMatch(_) => "Mise à jour prévue à la fin du match".into(),
+            Self::Downloading(_) => "Téléchargement de la mise à jour…".into(),
+            Self::Installing => "Installation de la mise à jour…".into(),
+            Self::Failed(_) => "Mise à jour impossible, réessaie plus tard".into(),
+        }
+    }
 }
 
 impl Status {
@@ -34,6 +91,9 @@ impl Status {
             queued: 0,
             sending_problem: None,
             last_received: false,
+            in_match: false,
+            update: Update::Idle,
+            toast: None,
         }
     }
 
@@ -125,5 +185,19 @@ mod tests {
         assert!(paired().starts_hidden());
         assert!(!Status::new(Setup::Changed, Some("player-one".into()), true).starts_hidden());
         assert!(!Status::new(Setup::Ready, None, false).starts_hidden());
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::Update;
+
+    #[test]
+    fn the_button_shows_only_when_an_update_can_start() {
+        assert_eq!(Update::Available("0.3.0".into()).offer(), Some("0.3.0"));
+        assert_eq!(Update::Failed("0.3.0".into()).offer(), Some("0.3.0"));
+        assert_eq!(Update::AfterMatch("0.3.0".into()).offer(), None);
+        assert!(Update::AfterMatch("0.3.0".into()).busy());
+        assert_eq!(Update::AfterMatch("0.3.0".into()).line(), "Mise à jour prévue à la fin du match");
     }
 }

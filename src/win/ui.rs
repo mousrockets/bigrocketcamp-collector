@@ -2,7 +2,7 @@
 
 use super::{APP_ID, set_start_with_windows, starts_with_windows, wide};
 use crate::service::{Service, clean_code};
-use crate::status::{Light, View, view};
+use crate::status::{Light, Status, Update, View, view};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr;
@@ -22,15 +22,15 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT,
-    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_NOSOUND, NIIF_RESPECT_QUIET_TIME, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_CENTER,
     ES_UPPERCASE, FindWindowW, GetMessageW, GetWindowTextW, HICON, HMENU, IDC_ARROW, IDOK, IsDialogMessageW, IsIconic,
-    LoadCursorW, LoadIconW, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
-    NONCLIENTMETRICSW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    LoadCursorW, LoadIconW, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
+    MessageBoxW, NONCLIENTMETRICSW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
     SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW,
     SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
     TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_NULL, WM_PAINT,
@@ -49,19 +49,22 @@ const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const ID_PAIR: i32 = IDOK;
 const ID_HELP: i32 = 102;
 const ID_CODE: i32 = 100;
+const ID_UPDATE: i32 = 103;
+const ID_CHECK: i32 = 104;
 const MENU_OPEN: usize = 1;
 const MENU_HELP: usize = 2;
 const MENU_STARTUP: usize = 3;
 const MENU_QUIT: usize = 4;
+const MENU_UPDATE: usize = 5;
+const MENU_CHECK: usize = 6;
 
+/// Resource ids, as in build.rs: the app icon, then live, waiting and problem, without and with the update sign.
 const ICON_APP: u16 = 1;
-const ICON_LIVE: u16 = 2;
-const ICON_WAITING: u16 = 3;
-const ICON_PROBLEM: u16 = 4;
+const TRAY_ICONS: [u16; 6] = [2, 3, 4, 5, 6, 7];
 
 const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-const WIDTH: i32 = 340;
-const HEIGHT: i32 = 168;
+const WIDTH: i32 = 380;
+const HEIGHT: i32 = 200;
 
 const HELP: &str = "Big Rocket Camp Collector envoie tes matchs Rocket League au club, tout seul.\n\n\
 1. Associer ce PC : dans Big Rocket Camp, ouvre ton profil, clique « Associer le collecteur », \
@@ -70,6 +73,8 @@ puis recopie ici le code à 8 caractères.\n\n\
 d’installation puis TAGame\\Config\\TAStatsAPI.ini (ou DefaultStatsAPI.ini s’il n’existe pas). Dans la section \
 [TAGame.MatchStatsExporter_TA], mets PacketSendRate=10, Port=0 et WebPort=49124, enregistre et relance le jeu.\n\n\
 3. Jouer : pastille verte, les matchs partent à la fin. Grise : le jeu n’est pas lancé. Rouge : lis le message.\n\n\
+Mises à jour : un bouton « Mettre à jour » apparaît quand une nouvelle version existe. Pendant un match, elle attend \
+la fin du match.\n\n\
 La croix range le collecteur près de l’horloge. Clic droit sur son icône pour le quitter ou le lancer avec Windows.";
 
 /// The window, for the background threads that only post it a message.
@@ -81,11 +86,14 @@ struct Ui {
     code: HWND,
     pair: HWND,
     help: HWND,
+    update: HWND,
+    check: HWND,
     font: HFONT,
     title_font: HFONT,
     dpi: u32,
-    icons: [HICON; 3],
-    light: Option<Light>,
+    icons: [HICON; 6],
+    icon: Option<usize>,
+    last_toast: u32,
     needs_pairing: bool,
     taskbar_created: u32,
 }
@@ -185,6 +193,8 @@ pub fn run(service: Arc<Service>, hidden: bool) {
         let code = child("EDIT", "", (ES_CENTER | ES_UPPERCASE | ES_AUTOHSCROLL) as u32, WS_EX_CLIENTEDGE, ID_CODE);
         let pair = child("BUTTON", "Associer", BS_DEFPUSHBUTTON as u32, 0, ID_PAIR);
         let help = child("BUTTON", "Aide", WS_VISIBLE | BS_PUSHBUTTON as u32, 0, ID_HELP);
+        let update = child("BUTTON", "Mettre à jour", BS_PUSHBUTTON as u32, 0, ID_UPDATE);
+        let check = child("BUTTON", "Rechercher les mises à jour", WS_VISIBLE | BS_PUSHBUTTON as u32, 0, ID_CHECK);
         SendMessageW(code, EM_SETLIMITTEXT, 12, 0);
         let cue = wide("Code à 8 caractères");
         SendMessageW(code, EM_SETCUEBANNER, 1, cue.as_ptr() as LPARAM);
@@ -199,11 +209,14 @@ pub fn run(service: Arc<Service>, hidden: bool) {
                 code,
                 pair,
                 help,
+                update,
+                check,
                 font,
                 title_font,
                 dpi,
-                icons: [ICON_LIVE, ICON_WAITING, ICON_PROBLEM].map(small_icon),
-                light: None,
+                icons: TRAY_ICONS.map(small_icon),
+                icon: None,
+                last_toast: 0,
                 needs_pairing: false,
                 taskbar_created,
             })
@@ -281,7 +294,7 @@ fn show(window: HWND) {
 
 impl Ui {
     fn apply_fonts(&self) {
-        for control in [self.code, self.pair, self.help] {
+        for control in [self.code, self.pair, self.help, self.update, self.check] {
             // SAFETY: child windows of this thread, and a live font.
             unsafe { SendMessageW(control, WM_SETFONT, self.font as WPARAM, 1) };
         }
@@ -303,9 +316,11 @@ impl Ui {
                 );
             }
         };
-        place(self.code, 52, 92, 150, 28);
-        place(self.pair, 210, 92, 110, 28);
-        place(self.help, 220, 130, 100, 28);
+        place(self.code, 52, 92, 170, 28);
+        place(self.pair, 230, 92, 130, 28);
+        place(self.update, 220, 126, 140, 28);
+        place(self.check, 20, 162, 190, 28);
+        place(self.help, 260, 162, 100, 28);
     }
 }
 
@@ -321,20 +336,34 @@ fn refresh(first: bool) {
         ui.needs_pairing = status.needs_pairing;
         let pairing_row = if status.needs_pairing { SW_SHOW } else { SW_HIDE };
         // SAFETY: windows owned by this thread.
+        let offer = status.update.offer();
         unsafe {
             ShowWindow(ui.code, pairing_row);
             ShowWindow(ui.pair, pairing_row);
             EnableWindow(ui.code, (!status.pairing) as i32);
             EnableWindow(ui.pair, (!status.pairing) as i32);
+            if let Some(version) = offer {
+                SetWindowTextW(ui.update, wide(&format!("Mettre à jour (v{version})")).as_ptr());
+            }
+            ShowWindow(ui.update, if offer.is_some() { SW_SHOW } else { SW_HIDE });
+            EnableWindow(ui.check, (!status.update.busy() && status.update != Update::Checking) as i32);
             InvalidateRect(ui.window, ptr::null(), 1);
         }
-        if ui.light != Some(current.light) {
-            ui.tray(if ui.light.is_none() { NIM_ADD } else { NIM_MODIFY }, &current);
-            ui.light = Some(current.light);
-        } else {
-            ui.tray(NIM_MODIFY, &current);
+        let added = ui.icon.is_some();
+        ui.icon = Some(ui.tray(if added { NIM_MODIFY } else { NIM_ADD }, &current, &status));
+        if let Some((id, text)) = &status.toast
+            && *id != ui.last_toast
+        {
+            ui.last_toast = *id;
+            ui.toast(text);
         }
     });
+    if status.update == Update::Installing {
+        // The installer replaces the executable, then starts the new collector.
+        // SAFETY: this thread's own window.
+        unsafe { DestroyWindow(window) };
+        return;
+    }
     if paired_now {
         with_ui(|ui| {
             // SAFETY: a child window of this thread.
@@ -353,12 +382,15 @@ fn refresh(first: bool) {
 }
 
 impl Ui {
-    fn tray(&self, message: u32, current: &View) {
-        let icon = self.icons[match current.light {
+    /// Shows the status in the notification area; returns which icon is shown.
+    fn tray(&self, message: u32, current: &View, status: &Status) -> usize {
+        let light = match current.light {
             Light::Live => 0,
             Light::Waiting => 1,
             Light::Problem => 2,
-        }];
+        };
+        let index = if status.update.badge() { light + 3 } else { light };
+        let icon = self.icons[index];
         // SAFETY: NOTIFYICONDATAW is plain data; the icons live as long as the process.
         unsafe {
             let mut data: NOTIFYICONDATAW = std::mem::zeroed();
@@ -375,6 +407,25 @@ impl Ui {
             }
             data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
             Shell_NotifyIconW(NIM_SETVERSION, &data);
+        }
+        index
+    }
+
+    /// A standard Windows notification: it never takes the focus, and Windows holds it back during a full-screen game.
+    fn toast(&self, text: &str) {
+        // SAFETY: NOTIFYICONDATAW is plain data, and the strings are cut to the buffers' sizes.
+        unsafe {
+            let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+            data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+            data.hWnd = self.window;
+            data.uID = 1;
+            data.uFlags = NIF_INFO;
+            data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND | NIIF_RESPECT_QUIET_TIME;
+            let title: Vec<u16> = TITLE.encode_utf16().take(63).collect();
+            data.szInfoTitle[..title.len()].copy_from_slice(&title);
+            let body: Vec<u16> = text.encode_utf16().take(255).collect();
+            data.szInfo[..body.len()].copy_from_slice(&body);
+            Shell_NotifyIconW(NIM_MODIFY, &data);
         }
     }
 
@@ -413,12 +464,21 @@ fn pair() {
 
 fn menu(window: HWND, x: i32, y: i32) {
     let startup = starts_with_windows();
+    let Some(status) = with_ui(|ui| ui.service.status()) else { return };
+    let update_label = match status.update.offer() {
+        Some(version) => format!("Mettre à jour (v{version})"),
+        None => "Mettre à jour".to_owned(),
+    };
+    let update_flags = if status.update.offer().is_some() { MF_STRING } else { MF_STRING | MF_GRAYED };
     // SAFETY: a menu created, shown and destroyed here; strings outlive the calls.
     let choice = unsafe {
         let menu = CreatePopupMenu();
         let items = [
             (MF_STRING, MENU_OPEN, "Ouvrir"),
             (MF_STRING, MENU_HELP, "Aide"),
+            (MF_SEPARATOR, 0, ""),
+            (update_flags, MENU_UPDATE, update_label.as_str()),
+            (MF_STRING, MENU_CHECK, "Rechercher les mises à jour"),
             (MF_SEPARATOR, 0, ""),
             (MF_STRING | if startup { MF_CHECKED } else { 0 }, MENU_STARTUP, "Lancer au démarrage de Windows"),
             (MF_SEPARATOR, 0, ""),
@@ -436,6 +496,8 @@ fn menu(window: HWND, x: i32, y: i32) {
     match choice {
         MENU_OPEN => show(window),
         MENU_HELP => help(window),
+        MENU_UPDATE => request_update(),
+        MENU_CHECK => check_now(window),
         MENU_STARTUP => {
             set_start_with_windows(!startup);
             with_ui(|ui| ui.service.change_settings(|settings| settings.autostart_chosen = true));
@@ -446,6 +508,20 @@ fn menu(window: HWND, x: i32, y: i32) {
         },
         _ => {}
     }
+}
+
+fn request_update() {
+    if let Some(service) = with_ui(|ui| Arc::clone(&ui.service)) {
+        service.request_update();
+    }
+}
+
+/// The answer appears in the window, so the window comes forward.
+fn check_now(window: HWND) {
+    if let Some(service) = with_ui(|ui| Arc::clone(&ui.service)) {
+        service.check_now();
+    }
+    show(window);
 }
 
 fn paint(window: HWND) {
@@ -479,15 +555,15 @@ fn paint(window: HWND) {
         text(
             dc,
             &current.title,
-            RECT { left: d(52), top: d(14), right: d(320), bottom: d(46) },
+            RECT { left: d(52), top: d(14), right: d(360), bottom: d(46) },
             DT_SINGLELINE | DT_VCENTER,
         );
         SelectObject(dc, font);
-        let detail_bottom = if status.needs_pairing { 88 } else { 124 };
+        let detail_bottom = 88;
         text(
             dc,
             &current.detail,
-            RECT { left: d(52), top: d(48), right: d(320), bottom: d(detail_bottom) },
+            RECT { left: d(52), top: d(48), right: d(360), bottom: d(detail_bottom) },
             DT_WORDBREAK,
         );
         if let (Some(player), false) = (&status.player, status.needs_pairing) {
@@ -496,7 +572,17 @@ fn paint(window: HWND) {
             text(
                 dc,
                 &line,
-                RECT { left: d(20), top: d(130), right: d(212), bottom: d(158) },
+                RECT { left: d(52), top: d(92), right: d(360), bottom: d(120) },
+                DT_SINGLELINE | DT_VCENTER,
+            );
+        }
+        {
+            SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+            let right = if status.update.offer().is_some() { 212 } else { 360 };
+            text(
+                dc,
+                &status.update.line(),
+                RECT { left: d(20), top: d(126), right: d(right), bottom: d(154) },
                 DT_SINGLELINE | DT_VCENTER,
             );
         }
@@ -536,6 +622,8 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
         WM_COMMAND => match low_word(wparam) {
             ID_PAIR => pair(),
             ID_HELP => help(window),
+            ID_UPDATE => request_update(),
+            ID_CHECK => check_now(window),
             _ => {}
         },
         // The cross hides the window; the collector keeps running next to the clock.
@@ -584,7 +672,7 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
         _ => {
             if with_ui(|ui| ui.taskbar_created == message).unwrap_or(false) {
                 // Explorer restarted: the icon must be added again.
-                with_ui(|ui| ui.light = None);
+                with_ui(|ui| ui.icon = None);
                 refresh(true);
             }
             // SAFETY: default handling of every other message.

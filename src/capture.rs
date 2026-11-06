@@ -220,6 +220,11 @@ impl MatchCapture {
     pub fn reset(&mut self) {
         self.current = None;
     }
+
+    /// A match followed since its start and not finished yet.
+    pub fn in_match(&self) -> bool {
+        self.current.as_ref().is_some_and(|current| !current.sent)
+    }
 }
 
 /// The fields of an update kept in the scoreboard, in the browser's order; `None` where the browser would throw.

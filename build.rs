@@ -9,12 +9,15 @@ fn main() {
         return;
     }
     let mut resource = winresource::WindowsResource::new();
-    // The ids match ICON_APP, ICON_LIVE, ICON_WAITING and ICON_PROBLEM in src/win/ui.rs.
+    // The ids match ICON_APP and TRAY_ICONS in src/win/ui.rs.
     resource
         .set_icon("assets/icons/app.ico")
         .set_icon_with_id("assets/icons/live.ico", "2")
         .set_icon_with_id("assets/icons/waiting.ico", "3")
         .set_icon_with_id("assets/icons/problem.ico", "4")
+        .set_icon_with_id("assets/icons/live-update.ico", "5")
+        .set_icon_with_id("assets/icons/waiting-update.ico", "6")
+        .set_icon_with_id("assets/icons/problem-update.ico", "7")
         .set_manifest_file("assets/collector.manifest")
         .set("ProductName", "Big Rocket Camp Collector")
         .set("FileDescription", "Big Rocket Camp Collector")
