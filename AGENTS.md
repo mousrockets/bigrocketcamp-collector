@@ -9,6 +9,7 @@ Big Rocket Camp Collector est une petite app Windows native en Rust, sans WebVie
 - `src/capture.rs` et `src/bridge.rs` sont des portages de `src/lib/live-stats.ts` et `src/lib/live-bridge.ts` de l'app web (`mousrockets/bigrocketcamp`). Le corps envoyé doit rester identique à celui du pont web : un changement de règle se fait des deux côtés, avec les mêmes cas de test.
 - `src/rocket_league.rs` trouve le jeu (Epic, Steam) et règle son Stats API.
 - `src/win/` contient tout le code Windows : fenêtre, icône de notification, DPAPI, registre.
+- `src/update.rs` trouve une nouvelle release sur GitHub et vérifie son installateur ; la mise à jour ne se lance qu'au clic du joueur, et jamais pendant un match.
 - L'adresse de l'instance est fixée à la compilation : variable `APP_URL`, par défaut `https://mousrockets.com`. En CI, c'est la variable de dépôt `APP_URL`.
 
 ## Avec qui tu travailles
@@ -42,9 +43,12 @@ Big Rocket Camp Collector est une petite app Windows native en Rust, sans WebVie
 
 ## Publier une version
 
-1. Monte la version dans `Cargo.toml`, par PR.
-2. Après la fusion, un mainteneur pousse le tag `vX.Y.Z` sur `main`.
-3. La CI vérifie que le tag correspond à la version, construit l'installateur et le publie dans la release du tag (`BigRocketCampCollector-setup.exe`).
+1. Monte `version` dans `Cargo.toml` (semver : `X.Y.Z`), par PR. `Cargo.lock` suit avec `cargo check`.
+2. Après la fusion et une CI verte sur `main`, pousse le tag : `git tag vX.Y.Z origin/main && git push origin vX.Y.Z`.
+3. La CI vérifie que le tag correspond à `Cargo.toml`, construit l'installateur, génère `SHA256SUMS` et publie la release `vX.Y.Z` avec ces deux fichiers. Vérifie-le avec `gh release view vX.Y.Z`.
+4. Ne remplace jamais les fichiers d'une release publiée : publie une nouvelle version.
+
+Les collecteurs installés proposent la mise à jour d'eux-mêmes : ils lisent `releases/latest` de ce dépôt (`repository` dans `Cargo.toml`), et n'installent qu'un fichier dont l'empreinte correspond à `SHA256SUMS`.
 
 ## Stack
 
