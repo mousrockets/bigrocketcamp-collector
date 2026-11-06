@@ -26,7 +26,7 @@ Big Rocket Camp Collector est une petite app Windows native en Rust, sans WebVie
 
 - `cargo test` : les tests (capture, file, réglage du jeu, état affiché). Ils tournent aussi sur Mac et Linux.
 - `cargo fmt` puis `cargo clippy --all-targets -- -D warnings` : doivent passer avant toute PR.
-- `cargo build --release` : construit le collecteur (sous Windows). L'installateur se construit avec NSIS : voir `.github/workflows/ci.yml`.
+- `cargo build --release` : construit le collecteur (sous Windows). L'installateur se construit avec Inno Setup (`installer/collector.iss`), présent sur les runners Windows de GitHub : voir `.github/workflows/ci.yml`.
 - Depuis un Mac, `cargo clippy --target x86_64-pc-windows-msvc` vérifie le code Windows ; il demande un `llvm-rc` dans le `PATH` pour les ressources.
 
 ## Workflow
