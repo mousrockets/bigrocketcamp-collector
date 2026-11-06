@@ -1,34 +1,103 @@
-# Big Rocket Camp Direct
+# Big Rocket Camp Collector
 
 Le petit outil Windows qui envoie tes matchs Rocket League à [Big Rocket Camp](https://mousrockets.com).
 
-Tu le lances en même temps que le jeu. À la fin de chaque match, il récupère le tableau final sur ton PC et l'envoie au club : plus besoin de garder un onglet de navigateur ouvert sur la page Direct. Si Internet coupe, les matchs attendent et partent au retour de la connexion.
+Une fois réglé, tu ne le vois plus : il démarre avec Windows, reste près de l'horloge et envoie chaque tableau de fin de match au club. Si Internet coupe, les matchs attendent sur le PC et partent au retour de la connexion.
 
 ## Télécharger
 
-[**Télécharger l'installateur**](https://github.com/mousrockets/bigrocketcamp-direct/releases/latest/download/BigRocketCampDirect-setup.exe) (dernière version, Windows 10 ou 11).
-
-Le dépôt est privé pour l'instant : connecte-toi d'abord à GitHub avec un compte membre de l'organisation mousrockets. Toutes les versions sont dans les [releases](https://github.com/mousrockets/bigrocketcamp-direct/releases/latest).
+[**Télécharger l'installateur**](https://github.com/mousrockets/bigrocketcamp-collector/releases/latest/download/BigRocketCampCollector-setup.exe) (dernière version, Windows 10 ou 11). Toutes les versions sont dans les [releases](https://github.com/mousrockets/bigrocketcamp-collector/releases).
 
 ## Installer
 
-1. Ouvre `BigRocketCampDirect-setup.exe`.
+1. Ouvre `BigRocketCampCollector-setup.exe`.
 2. Windows affiche « Windows a protégé votre ordinateur » : l'outil n'est pas encore signé, c'est normal. Clique sur **Informations complémentaires**, puis **Exécuter quand même**.
-3. Suis l'installation. Aucun mot de passe administrateur n'est demandé. Laisse cochée la case qui crée le raccourci sur le bureau.
+3. L'installation se fait pour ton compte Windows, sans mot de passe administrateur. Elle crée un raccourci sur le bureau et dans le menu Démarrer.
 
-L'outil s'installe pour ton compte Windows seulement, avec un raccourci « Big Rocket Camp Direct » sur le bureau et dans le menu Démarrer. Pour le désinstaller : Paramètres → Applications.
+Pour le désinstaller : Paramètres → Applications → Big Rocket Camp Collector. Ses données sur le PC partent avec lui.
 
 ## Premier lancement
 
-1. **Connecte-toi** avec ton adresse e-mail, puis le code à 6 chiffres reçu. Tu restes connecté ensuite, même après un redémarrage.
-2. **Rocket League** : au lancement, l'outil cherche le jeu (Epic Games ou Steam) et active son Stats API. S'il a changé quelque chose, il te le dit : relance alors Rocket League. S'il n'a pas pu (dossier protégé, jeu introuvable), suis les étapes « À régler une seule fois sur le PC » affichées dans la fenêtre.
-3. Clique sur **Activer le direct sur ce PC**. L'outil s'en souvient pour les fois suivantes.
-4. **Garde la fenêtre ouverte pendant tes parties**, réduite si tu veux, et attends le tableau final avant de quitter un match.
+1. **Associe le collecteur** : dans Big Rocket Camp, ouvre ton profil et clique « Associer le collecteur ». Recopie le code à 8 caractères dans la fenêtre du collecteur, puis **Associer**.
+2. **Rocket League** est réglé tout seul au lancement (Epic Games ou Steam). Si le collecteur te dit qu'il l'a réglé, relance le jeu. S'il n'y arrive pas, le bouton **Aide** explique le réglage à la main.
+3. **C'est fini.** Ferme la fenêtre avec la croix : le collecteur reste dans la zone de notification, près de l'horloge, et démarre ensuite avec Windows.
 
-Si la fenêtre affiche une erreur de connexion (PC lancé sans Internet), appuie sur F5.
+La pastille et l'icône changent de couleur :
+
+- **verte** : en direct, le jeu est connecté et les matchs partent à la fin ;
+- **grise** : en attente de Rocket League ;
+- **rouge** : un problème, expliqué en une phrase dans la fenêtre.
+
+Un clic sur l'icône rouvre la fenêtre. Un clic droit propose : Ouvrir, Aide, Lancer au démarrage de Windows, Quitter.
+
+Attends le tableau final avant de quitter un match : sans lui, aucun résultat n'est envoyé.
+
+## Léger pendant les parties
+
+- Priorité basse et mode efficacité de Windows : le jeu passe toujours en premier.
+- Aucune boucle active : le collecteur attend les messages du jeu et de Windows.
+- Un seul envoi réseau par fin de match, et aucune écriture sur le disque pendant une partie.
+
+## Ce que le collecteur garde sur le PC
+
+Dans `%LOCALAPPDATA%\BigRocketCampCollector`, supprimé à la désinstallation :
+
+- `token.bin` : le jeton d'association, chiffré avec DPAPI pour ton seul compte Windows ;
+- `queue.json` : les matchs pas encore reçus par le club (20 au plus, moins d'un jour) ;
+- `settings.json` : le nom du joueur associé et ton choix de démarrage avec Windows.
+
+Il modifie aussi trois réglages du Stats API dans le dossier de Rocket League (`TAStatsAPI.ini` ou `DefaultStatsAPI.ini`), après en avoir gardé une copie `.bak`.
+
+## API attendue
+
+Le collecteur parle à l'instance définie à la compilation (`APP_URL`, par défaut `https://mousrockets.com`). Ces routes n'existent pas encore dans l'app web : voici le contrat qu'il suit. Il ne suit aucune redirection et s'annonce avec `User-Agent: bigrocketcamp-collector/<version>`.
+
+### Associer : `POST /api/collector/pair`
+
+Dans l'app web, le membre clique « Associer le collecteur » dans son profil et reçoit un code de 8 caractères, valable 10 minutes et utilisable une fois.
+
+```http
+POST /api/collector/pair
+Content-Type: application/json
+
+{"code":"AB12CD34"}
+```
+
+- Le collecteur envoie le code en majuscules, sans espaces ni tirets. Aucun cookie, aucun en-tête `Authorization`.
+- `200` : `{"token":"…","player":"joueur-un"}`. `player` est le nom affiché dans la fenêtre.
+- Autre réponse : le collecteur affiche `error` s'il est présent (`{"error":"Code invalide ou expiré."}`), sinon « Code invalide ou expiré. ».
+- `404` : le collecteur comprend que le site ne propose pas encore l'association.
+
+### Envoyer un match : `POST /api/live`
+
+```http
+POST /api/live
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{"state":{…},"end":{…},"startedAt":…,"endedAt":…,"seenIds":[…]}
+```
+
+- Le corps est exactement celui que le pont web envoie aujourd'hui, champ pour champ et dans le même ordre (voir `src/capture.rs`, porté de `src/lib/live-stats.ts`).
+- Sans cookie ni en-tête `Origin` : avec un jeton `Bearer`, la route ne doit pas exiger la même origine. Elle vérifie toujours que le tableau contient un identifiant de jeu du membre du jeton.
+- `200` : `{"ok":true,"match":"<MatchGuid sans espaces, en minuscules>"}`. Sans cette confirmation exacte, le match reste dans la file.
+- `400` ou `413` : refus définitif, le match est retiré de la file.
+- `401` : jeton révoqué. Le collecteur l'efface et redemande un code.
+- Autre réponse, ou site injoignable : nouvel essai 10 secondes plus tard. `error` est affiché s'il est présent.
+
+### Vérifier l'association : `GET /api/collector/status`
+
+```http
+GET /api/collector/status
+Authorization: Bearer <token>
+```
+
+- Appelé une fois au lancement.
+- `200` : `{"player":"joueur-un"}`.
+- `401` : jeton révoqué, le collecteur redemande un code.
 
 ## Pour les développeurs
 
-Les règles du projet et les commandes sont dans [AGENTS.md](AGENTS.md). Une autre instance de Big Rocket Camp construit son propre outil en définissant `APP_URL` à la compilation (variable de dépôt `APP_URL` en CI).
+Les règles du projet et les commandes sont dans [AGENTS.md](AGENTS.md). Une autre instance de Big Rocket Camp construit son propre collecteur en définissant `APP_URL` à la compilation (variable de dépôt `APP_URL` en CI).
 
 Licence MIT.
