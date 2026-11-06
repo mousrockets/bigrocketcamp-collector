@@ -1,0 +1,52 @@
+# Every pull request merges by itself once the required checks pass.
+# Squash by default; the `rebase` label keeps deliberately atomic commits.
+# Pull requests are written in French and commits in English: the squashed commit
+# takes the message of the pull request's first commit, not its title.
+#
+# GitHub's auto-merge alone misses a pull request whose checks were already green when
+# auto-merge was turned on (reopened, edited, re-run). So the merge is also attempted
+# each time CI succeeds on a pull request. Here CI runs on `push`, which covers every pull request
+# branch of this repository: `workflow_run.pull_requests` names the pull requests of the pushed branch.
+name: Auto-merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository
+        && !github.event.pull_request.draft)
+      || (github.event_name == 'workflow_run'
+        && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'pull_request')
+        && github.event.workflow_run.conclusion == 'success')
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBERS: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || join(github.event.workflow_run.pull_requests.*.number, ' ') }}
+        run: |
+          for number in $NUMBERS; do
+            pr=$(gh pr view "$number" --json isDraft,state,labels,headRepositoryOwner,headRepository)
+            if [ "$(echo "$pr" | jq -r '.state')" != OPEN ] || [ "$(echo "$pr" | jq -r '.isDraft')" = true ]; then continue; fi
+            if [ "$(echo "$pr" | jq -r '.headRepositoryOwner.login + "/" + .headRepository.name')" != "$GH_REPO" ]; then continue; fi
+            gh pr merge --disable-auto "$number" || true
+            if echo "$pr" | jq -e '.labels | map(.name) | index("rebase")' > /dev/null; then
+              gh pr merge --auto --rebase "$number"
+            else
+              message=$(gh api "repos/$GH_REPO/pulls/$number/commits" --jq '.[0].commit.message')
+              subject="$(printf '%s\n' "$message" | head -n 1) (#$number)"
+              body=$(printf '%s\n' "$message" | tail -n +3)
+              gh pr merge --auto --squash --subject "$subject" --body "$body" "$number"
+            fi
+          done
