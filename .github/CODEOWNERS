@@ -1,4 +1,5 @@
 # Only what can change the installer handed to players or the rules of the project waits for a maintainer.
 /.github/ @dimitridepardieu
-/src-tauri/tauri.conf.json @dimitridepardieu
+/installer/ @dimitridepardieu
+/assets/collector.manifest @dimitridepardieu
 /AGENTS.md @dimitridepardieu
