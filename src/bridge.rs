@@ -108,7 +108,8 @@ impl Queue {
                 }
                 let error = reply["error"].as_str().unwrap_or("Envoi refusé par le site.").to_owned();
                 // A refused scoreboard will never be accepted: drop it instead of retrying forever.
-                if status == 400 || status == 413 {
+                // 403: none of its players belongs to the paired member.
+                if matches!(status, 400 | 403 | 413) {
                     self.shift();
                     report(Event::Dropped(error));
                     continue;
@@ -171,6 +172,7 @@ mod tests {
     fn drops_refused_matches_and_keeps_the_others_for_later() {
         let mut q = queue("refused");
         q.add(payload("refused-match"));
+        q.add(payload("foreign-match"));
         q.add(payload("later-match"));
         let mut events = Vec::new();
         let next = q.upload(
@@ -178,6 +180,8 @@ mod tests {
             |body| {
                 if body.contains("refused-match") {
                     Some((400, r#"{"error":"Tableau final incomplet."}"#.into()))
+                } else if body.contains("foreign-match") {
+                    Some((403, r#"{"error":"Aucun joueur du membre."}"#.into()))
                 } else {
                     Some((503, String::new()))
                 }
@@ -187,7 +191,11 @@ mod tests {
         assert_eq!(next, Next::Retry);
         assert_eq!(
             events,
-            [Event::Dropped("Tableau final incomplet.".into()), Event::Failed("Envoi refusé par le site.".into())]
+            [
+                Event::Dropped("Tableau final incomplet.".into()),
+                Event::Dropped("Aucun joueur du membre.".into()),
+                Event::Failed("Envoi refusé par le site.".into())
+            ]
         );
         assert_eq!(q.len(), 1);
     }
