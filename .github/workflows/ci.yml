@@ -60,14 +60,18 @@ jobs:
           "Working set: {0:N1} MB, private memory: {1:N1} MB, threads: {2}, CPU time: {3:N3} s" -f `
             ($process.WorkingSet64 / 1MB), ($process.PrivateMemorySize64 / 1MB), $process.Threads.Count, $process.TotalProcessorTime.TotalSeconds
           "Priority: {0}" -f $process.PriorityClass
+          # What Task Manager shows by default: the private working set, without shared system libraries.
+          $private = (Get-Counter "\Process($($exe.BaseName))\Working Set - Private").CounterSamples[0].CookedValue
+          "Private working set: {0:N1} MB" -f ($private / 1MB)
           Stop-Process -Id $process.Id
       - name: Build the installer
+        shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          makensis=$(command -v makensis || echo "/c/Program Files (x86)/NSIS/makensis.exe")
-          "$makensis" -DVERSION="$VERSION" -DOUTFILE="$PWD/BigRocketCampCollector-setup.exe" installer/collector.nsi
-          ls -l BigRocketCampCollector-setup.exe
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q "/DVersion=$env:VERSION" installer\collector.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "Installer: {0:N0} KB" -f ((Get-Item BigRocketCampCollector-setup.exe).Length / 1KB)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: installer
