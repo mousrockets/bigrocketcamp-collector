@@ -28,9 +28,17 @@ La pastille et l'icône changent de couleur :
 - **grise** : en attente de Rocket League ;
 - **rouge** : un problème, expliqué en une phrase dans la fenêtre.
 
-Un clic sur l'icône rouvre la fenêtre. Un clic droit propose : Ouvrir, Aide, Lancer au démarrage de Windows, Quitter.
+Un clic sur l'icône rouvre la fenêtre. Un clic droit propose : Ouvrir, Aide, Mettre à jour, Rechercher les mises à jour, Lancer au démarrage de Windows, Quitter.
 
 Attends le tableau final avant de quitter un match : sans lui, aucun résultat n'est envoyé.
+
+## Mises à jour
+
+- Le collecteur regarde s'il existe une nouvelle version au lancement, puis toutes les 6 heures. **Rechercher les mises à jour** (dans la fenêtre ou le menu de l'icône) vérifie tout de suite.
+- Quand une version est disponible, un bouton **Mettre à jour (vX.Y.Z)** apparaît dans la fenêtre et dans le menu, et l'icône porte un point bleu. Rien ne s'ouvre tout seul.
+- La mise à jour ne se fait qu'au clic. Elle télécharge l'installateur, vérifie son empreinte SHA-256 avec le fichier `SHA256SUMS` de la release, l'installe sans questions puis relance le collecteur.
+- Pendant un match, elle attend la fin du match : la fenêtre affiche « Mise à jour prévue à la fin du match », et une notification Windows le confirme, puis annonce le début de la mise à jour. Ces notifications ne prennent pas le focus et Windows les retient pendant un jeu en plein écran.
+- L'association et les matchs en attente sont conservés.
 
 ## Léger pendant les parties
 
@@ -50,11 +58,11 @@ Il modifie aussi trois réglages du Stats API dans le dossier de Rocket League (
 
 ## API attendue
 
-Le collecteur parle à l'instance définie à la compilation (`APP_URL`, par défaut `https://mousrockets.com`). Ces routes n'existent pas encore dans l'app web : voici le contrat qu'il suit. Il ne suit aucune redirection et s'annonce avec `User-Agent: bigrocketcamp-collector/<version>`.
+Le collecteur parle à l'instance définie à la compilation (`APP_URL`, par défaut `https://mousrockets.com`). Le contrat de référence est `docs/collecteur.md` dans `mousrockets/bigrocketcamp` ; voici ce que le collecteur en utilise. Il ne suit aucune redirection et s'annonce avec `User-Agent: bigrocketcamp-collector/<version>`.
 
 ### Associer : `POST /api/collector/pair`
 
-Dans l'app web, le membre clique « Associer le collecteur » dans son profil et reçoit un code de 8 caractères, valable 10 minutes et utilisable une fois.
+Dans l'app web, le membre clique « Associer le collecteur » dans son profil et reçoit un code de 8 caractères (`ABCD EFGH`), valable 10 minutes et utilisable une fois.
 
 ```http
 POST /api/collector/pair
@@ -65,8 +73,7 @@ Content-Type: application/json
 
 - Le collecteur envoie le code en majuscules, sans espaces ni tirets. Aucun cookie, aucun en-tête `Authorization`.
 - `200` : `{"token":"…","player":"joueur-un"}`. `player` est le nom affiché dans la fenêtre.
-- Autre réponse : le collecteur affiche `error` s'il est présent (`{"error":"Code invalide ou expiré."}`), sinon « Code invalide ou expiré. ».
-- `404` : le collecteur comprend que le site ne propose pas encore l'association.
+- `400` (code mal formé) ou `401` (code inconnu, expiré, déjà utilisé ou bloqué) : le collecteur affiche `error`, sinon « Code invalide ou expiré. ».
 
 ### Envoyer un match : `POST /api/live`
 
@@ -81,7 +88,7 @@ Content-Type: application/json
 - Le corps est exactement celui que le pont web envoie aujourd'hui, champ pour champ et dans le même ordre (voir `src/capture.rs`, porté de `src/lib/live-stats.ts`).
 - Sans cookie ni en-tête `Origin` : avec un jeton `Bearer`, la route ne doit pas exiger la même origine. Elle vérifie toujours que le tableau contient un identifiant de jeu du membre du jeton.
 - `200` : `{"ok":true,"match":"<MatchGuid sans espaces, en minuscules>"}`. Sans cette confirmation exacte, le match reste dans la file.
-- `400` ou `413` : refus définitif, le match est retiré de la file.
+- `400`, `403` (aucun joueur du membre dans le tableau) ou `413` : refus définitif, le match est retiré de la file.
 - `401` : jeton révoqué. Le collecteur l'efface et redemande un code.
 - Autre réponse, ou site injoignable : nouvel essai 10 secondes plus tard. `error` est affiché s'il est présent.
 
@@ -95,6 +102,17 @@ Authorization: Bearer <token>
 - Appelé une fois au lancement.
 - `200` : `{"player":"joueur-un"}`.
 - `401` : jeton révoqué, le collecteur redemande un code.
+
+## Publier une version
+
+Tout passe par la CI, sans manipulation à la main :
+
+1. Monter `version` dans `Cargo.toml` (par exemple `0.3.0`), par PR, et la fusionner une fois la CI verte.
+2. Pousser le tag sur `main` : `git tag v0.3.0 && git push origin v0.3.0`.
+3. La CI vérifie que le tag correspond à `Cargo.toml`, construit et mesure le collecteur, crée l'installateur, puis publie la release `v0.3.0` avec `BigRocketCampCollector-setup.exe` et `SHA256SUMS`.
+4. Les collecteurs installés voient la nouvelle version au plus tard 6 heures après (ou tout de suite avec « Rechercher les mises à jour »).
+
+Une release sans `SHA256SUMS` n'est jamais proposée en mise à jour.
 
 ## Pour les développeurs
 
