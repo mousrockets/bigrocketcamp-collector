@@ -115,6 +115,8 @@ struct CurrentMatch {
     last: Option<Value>,
     /// `TimeSeconds` and `bOvertime` as `keep_clock` keeps them.
     clock: Map<String, Value>,
+    /// The clock's changes around `MatchEnded`, as `trace_clock` keeps them.
+    trace: Vec<Value>,
     sent: bool,
 }
 
@@ -181,6 +183,7 @@ impl MatchCapture {
                 candidate: None,
                 last: None,
                 clock: Map::new(),
+                trace: Vec::new(),
                 sent: false,
             });
             return previous;
@@ -214,6 +217,7 @@ impl MatchCapture {
         if let Some(state) = usable {
             current.last = Some(state.clone());
             keep_clock(&mut current.clock, &data["Game"], current.end.is_some());
+            trace_clock(&mut current.trace, &data["Game"], current.end.is_some());
         }
         current.end.as_ref()?;
         let Some(payload) = usable.and_then(|state| scoreboard(current, state)) else {
@@ -283,11 +287,15 @@ fn scoreboard(current: &CurrentMatch, state: &Value) -> Option<Value> {
     payload.insert("startedAt".into(), current.started_at.into());
     payload.insert("endedAt".into(), current.ended_at.map_or(Value::Null, Value::from));
     payload.insert("seenIds".into(), Value::Array(seen));
+    if !current.trace.is_empty() {
+        payload.insert("clockTrace".into(), Value::Array(current.trace.clone()));
+    }
     Some(Value::Object(payload))
 }
 
-/// The clock of the last update before `MatchEnded`, which the API reads a forfeit from. An update after the end
-/// can only lower the time left: the tick that reached 0:00 may arrive after `MatchEnded`.
+/// The clock of the last update before `MatchEnded`, which the API reads a forfeit from. The tick that reaches 0:00
+/// may arrive after `MatchEnded`, so an update after the end lowers a clock that showed one second at most. More time
+/// left stays: the game may set the clock to 0:00 once a team forfeits, and the forfeit would be lost.
 fn keep_clock(kept: &mut Map<String, Value>, game: &Value, ended: bool) {
     if !ended {
         kept.clear();
@@ -295,13 +303,46 @@ fn keep_clock(kept: &mut Map<String, Value>, game: &Value, ended: bool) {
         copy(kept, game, "bOvertime");
         return;
     }
+    let kept_time = kept.get("TimeSeconds").and_then(Value::as_f64);
     if let Some(seen) = game.get("TimeSeconds").filter(|seen| seen.is_number())
-        && kept.get("TimeSeconds").and_then(Value::as_f64).is_none_or(|time| seen.as_f64() < Some(time))
+        && kept_time.is_none_or(|time| time <= 1.0 && seen.as_f64() < Some(time))
     {
         kept.insert("TimeSeconds".into(), seen.clone());
     }
     if !kept.contains_key("bOvertime") {
         copy(kept, game, "bOvertime");
+    }
+}
+
+/// How many changes of the clock the trace keeps on each side of `MatchEnded`.
+const CLOCK_TRACE_SIDE: usize = 6;
+
+/// Adds an update's clock to the trace when it changed: the last changes before the end, the first ones after. The
+/// game's way of ending a forfeit is not documented, and the API keeps the trace to show it. A game that sends no
+/// clock leaves the trace empty, and the payload without it.
+fn trace_clock(trace: &mut Vec<Value>, game: &Value, ended: bool) {
+    let mut sample = Map::new();
+    if let Some(time) = game.get("TimeSeconds").filter(|time| time.is_number()) {
+        sample.insert("TimeSeconds".into(), time.clone());
+    }
+    if let Some(overtime) = game.get("bOvertime").filter(|overtime| overtime.is_boolean()) {
+        sample.insert("bOvertime".into(), overtime.clone());
+    }
+    if sample.is_empty() {
+        return;
+    }
+    sample.insert("ended".into(), Value::Bool(ended));
+    let sample = Value::Object(sample);
+    if trace.last() == Some(&sample) {
+        return;
+    }
+    if !ended {
+        trace.push(sample);
+        if trace.len() > CLOCK_TRACE_SIDE {
+            trace.remove(0);
+        }
+    } else if trace.iter().filter(|kept| kept["ended"] == true).count() < CLOCK_TRACE_SIDE {
+        trace.push(sample);
     }
 }
 
@@ -859,9 +900,10 @@ mod tests {
         let game = r#""bHasWinner":true,"bReplay":false,"Winner":"Orange","TimeSeconds":143,"bOvertime":false}"#;
         assert!(sent.to_string().contains(game), "{sent}");
         assert_eq!(check_live_match(&sent, NOW), Ok(()));
-        // The tick that reached 0:00 after MatchEnded lowers the time left; overtime stays as it was before the end.
+        // A forfeit: the game may set the clock to 0:00 after the end, the time left before it stays, and so does
+        // overtime.
         let sent = clock_sent(json!({ "TimeSeconds": 0, "bOvertime": true }));
-        assert_eq!(sent["state"]["Game"]["TimeSeconds"], 0);
+        assert_eq!(sent["state"]["Game"]["TimeSeconds"], 143);
         assert_eq!(sent["state"]["Game"]["bOvertime"], false);
         // An update after the end without the clock keeps the one before it.
         let sent = clock_sent(json!({}));
@@ -890,6 +932,53 @@ mod tests {
         let sent = capture.handle(&packet("MatchDestroyed", guid), NOW).unwrap();
         assert_eq!(sent["state"]["Game"]["TimeSeconds"], 97);
         assert_eq!(sent["state"]["Game"]["bOvertime"], false);
+    }
+
+    #[test]
+    fn the_tick_that_reaches_zero_after_the_end_lowers_the_last_second() {
+        let p = payload("last-second");
+        let mut capture = MatchCapture::default();
+        let mut received = Vec::new();
+        capture.handle(&packet("MatchCreated", json!({ "MatchGuid": "last-second" })), NOW);
+        let mut before = p["state"].clone();
+        before["Game"]["TimeSeconds"] = json!(1);
+        before["Game"]["bOvertime"] = json!(false);
+        capture.handle(&packet("UpdateState", before), NOW);
+        capture.handle(&packet("MatchEnded", p["end"].clone()), NOW);
+        let mut last = p["state"].clone();
+        last["Game"]["TimeSeconds"] = json!(0);
+        for _ in 0..2 {
+            received.extend(capture.handle(&packet("UpdateState", last.clone()), NOW));
+        }
+        assert_eq!(received[0]["state"]["Game"]["TimeSeconds"], 0);
+    }
+
+    #[test]
+    fn sends_the_last_changes_of_the_clock_before_the_end_and_the_first_ones_after() {
+        let p = payload("trace");
+        let mut capture = MatchCapture::default();
+        let mut received = Vec::new();
+        capture.handle(&packet("MatchCreated", json!({ "MatchGuid": "trace" })), NOW);
+        let update = |time: i64| {
+            let mut state = p["state"].clone();
+            state["Game"]["TimeSeconds"] = json!(time);
+            state["Game"]["bOvertime"] = json!(false);
+            packet("UpdateState", state)
+        };
+        for time in (140..=150).rev() {
+            capture.handle(&update(time), NOW);
+        }
+        capture.handle(&update(140), NOW);
+        capture.handle(&packet("MatchEnded", p["end"].clone()), NOW);
+        for _ in 0..2 {
+            received.extend(capture.handle(&update(0), NOW));
+        }
+        let mut trace: Vec<Value> =
+            (140..=145).rev().map(|time| json!({ "TimeSeconds": time, "bOvertime": false, "ended": false })).collect();
+        trace.push(json!({ "TimeSeconds": 0, "bOvertime": false, "ended": true }));
+        assert_eq!(received[0]["clockTrace"], Value::Array(trace));
+        assert_eq!(received[0]["state"]["Game"]["TimeSeconds"], 140);
+        assert_eq!(check_live_match(&received[0], NOW), Ok(()));
     }
 
     #[test]
