@@ -128,13 +128,18 @@ struct CurrentMatch {
 impl CurrentMatch {
     /// What to send when the match is left. After its end and before two identical post-winner updates, the
     /// scoreboard: after a forfeit the losers often quit at once, and the game may stop sending updates. Before its
-    /// end, the left payload: the player left the match, which the API counts as a defeat.
-    fn left(self, now: i64) -> Option<Value> {
+    /// end, the left payload when the game itself left the match (`by_game`): the player left, which the API counts as
+    /// a defeat. A closed socket or a stopped collector says nothing about the player, so it sends no departure.
+    fn left(self, now: i64, by_game: bool) -> Option<Value> {
         if self.sent {
             return None;
         }
         let state = self.last.as_ref()?;
-        let payload = if self.end.is_some() { scoreboard(&self, state)? } else { left_match(&self, state, now)? };
+        let payload = match self.end {
+            Some(_) => scoreboard(&self, state)?,
+            None if by_game => left_match(&self, state, now)?,
+            None => return None,
+        };
         check_live_match(&payload, now).is_ok().then_some(payload)
     }
 }
@@ -145,7 +150,8 @@ impl CurrentMatch {
 /// match's cached scoreboard. The winner always comes from `MatchEnded`. Players without a real identifier
 /// (bots, players who left) are left out. Two identical post-winner updates send the scoreboard at once;
 /// otherwise the last known one goes when the match is left (`MatchDestroyed`, a new match, the game closing).
-/// A match left before `MatchEnded` returns the left payload instead, built from its last known scoreboard.
+/// A match the game leaves before `MatchEnded` (`MatchDestroyed`, a new match) returns the left payload instead,
+/// built from its last known scoreboard; the game closing then sends nothing.
 #[derive(Default)]
 pub struct MatchCapture {
     current: Option<CurrentMatch>,
@@ -172,7 +178,7 @@ impl MatchCapture {
                 return None;
             }
             "MatchDestroyed" => {
-                return if is_current { self.finish(now) } else { None };
+                return if is_current { self.leave(now, true) } else { None };
             }
             _ => {}
         }
@@ -181,7 +187,7 @@ impl MatchCapture {
             if is_current {
                 return None;
             }
-            let previous = self.finish(now);
+            let previous = self.leave(now, true);
             self.current = Some(CurrentMatch {
                 guid: guid.to_owned(),
                 started_at: now,
@@ -254,9 +260,14 @@ impl MatchCapture {
         self.current = None;
     }
 
-    /// Leaves the match being followed, and returns what `CurrentMatch::left` sends for it.
+    /// Stops following the match because the game closed or the collector stops: its scoreboard if it ended and was
+    /// not sent, never a left payload.
     pub fn finish(&mut self, now: i64) -> Option<Value> {
-        self.current.take()?.left(now)
+        self.leave(now, false)
+    }
+
+    fn leave(&mut self, now: i64, by_game: bool) -> Option<Value> {
+        self.current.take()?.left(now, by_game)
     }
 
     /// A match followed since its start and not finished yet.
@@ -1206,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn sends_the_left_payload_when_the_match_is_left_before_its_end() {
+    fn sends_the_left_payload_only_when_the_game_leaves_the_match_before_its_end() {
         let p = payload("left-early");
         let guid = json!({ "MatchGuid": "left-early" });
         let start = |capture: &mut MatchCapture| {
@@ -1247,10 +1258,11 @@ mod tests {
             assert!(capture.in_match());
         }
 
-        // The game closes.
+        // The socket closes or the collector stops: nothing tells that the player left, so no departure goes.
         let mut capture = MatchCapture::default();
         start(&mut capture);
-        assert_eq!(capture.finish(NOW).map(|sent| sent.to_string()), Some(expected.to_string()));
+        assert_eq!(capture.finish(NOW), None);
+        assert!(!capture.in_match());
     }
 
     #[test]
