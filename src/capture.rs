@@ -126,13 +126,15 @@ struct CurrentMatch {
 }
 
 impl CurrentMatch {
-    /// The scoreboard to send when the match is left before two identical post-winner updates: after a
-    /// forfeit the losers often quit at once, and the game may stop sending updates.
+    /// What to send when the match is left. After its end and before two identical post-winner updates, the
+    /// scoreboard: after a forfeit the losers often quit at once, and the game may stop sending updates. Before its
+    /// end, the left payload: the player left the match, which the API counts as a defeat.
     fn left(self, now: i64) -> Option<Value> {
         if self.sent {
             return None;
         }
-        let payload = scoreboard(&self, self.last.as_ref()?)?;
+        let state = self.last.as_ref()?;
+        let payload = if self.end.is_some() { scoreboard(&self, state)? } else { left_match(&self, state, now)? };
         check_live_match(&payload, now).is_ok().then_some(payload)
     }
 }
@@ -143,6 +145,7 @@ impl CurrentMatch {
 /// match's cached scoreboard. The winner always comes from `MatchEnded`. Players without a real identifier
 /// (bots, players who left) are left out. Two identical post-winner updates send the scoreboard at once;
 /// otherwise the last known one goes when the match is left (`MatchDestroyed`, a new match, the game closing).
+/// A match left before `MatchEnded` returns the left payload instead, built from its last known scoreboard.
 #[derive(Default)]
 pub struct MatchCapture {
     current: Option<CurrentMatch>,
@@ -251,7 +254,7 @@ impl MatchCapture {
         self.current = None;
     }
 
-    /// Leaves the match being followed, and returns its last known scoreboard if it ended and was not sent.
+    /// Leaves the match being followed, and returns what `CurrentMatch::left` sends for it.
     pub fn finish(&mut self, now: i64) -> Option<Value> {
         self.current.take()?.left(now)
     }
@@ -281,6 +284,37 @@ fn scoreboard(current: &CurrentMatch, state: &Value) -> Option<Value> {
     }
     let mut state = state.clone();
     state["Game"] = Value::Object(game);
+    let seen = seen_ids(current, &state)?;
+    let mut payload = Map::new();
+    payload.insert("state".into(), state);
+    payload.insert("end".into(), end.clone());
+    payload.insert("startedAt".into(), current.started_at.into());
+    payload.insert("endedAt".into(), current.ended_at.map_or(Value::Null, Value::from));
+    payload.insert("seenIds".into(), seen);
+    if !current.trace.is_empty() {
+        payload.insert("clockTrace".into(), Value::Array(current.trace.clone()));
+    }
+    let departures = departures(current);
+    if !departures.is_empty() {
+        payload.insert("departures".into(), Value::Array(departures));
+    }
+    Some(Value::Object(payload))
+}
+
+/// The payload sent to `/api/live` when the player leaves before `MatchEnded`: the last known scoreboard, without any
+/// winner. The API reads only the sender's own departure from it, the match not being over.
+fn left_match(current: &CurrentMatch, state: &Value, now: i64) -> Option<Value> {
+    let mut payload = Map::new();
+    payload.insert("left".into(), Value::Bool(true));
+    payload.insert("state".into(), state.clone());
+    payload.insert("startedAt".into(), current.started_at.into());
+    payload.insert("leftAt".into(), now.into());
+    payload.insert("seenIds".into(), seen_ids(current, state)?);
+    Some(Value::Object(payload))
+}
+
+/// The ids of the scoreboard's players, in the order the collector saw them.
+fn seen_ids(current: &CurrentMatch, state: &Value) -> Option<Value> {
     let ids: Vec<String> = state["Players"].as_array()?.iter().map(|player| canonical(&player["PrimaryId"])).collect();
     let mut seen = Vec::new();
     let mut kept = Vec::new();
@@ -291,20 +325,7 @@ fn scoreboard(current: &CurrentMatch, state: &Value) -> Option<Value> {
             seen.push(id.clone());
         }
     }
-    let mut payload = Map::new();
-    payload.insert("state".into(), state);
-    payload.insert("end".into(), end.clone());
-    payload.insert("startedAt".into(), current.started_at.into());
-    payload.insert("endedAt".into(), current.ended_at.map_or(Value::Null, Value::from));
-    payload.insert("seenIds".into(), Value::Array(seen));
-    if !current.trace.is_empty() {
-        payload.insert("clockTrace".into(), Value::Array(current.trace.clone()));
-    }
-    let departures = departures(current);
-    if !departures.is_empty() {
-        payload.insert("departures".into(), Value::Array(departures));
-    }
-    Some(Value::Object(payload))
+    Some(Value::Array(seen))
 }
 
 /// Remembers the players of a usable update before `MatchEnded`, and which of them are still there.
@@ -504,30 +525,69 @@ fn unique(values: impl Iterator<Item = String>) -> usize {
     seen.len()
 }
 
-/// The checks the API runs on a scoreboard, so that a match it would refuse is neither kept nor sent.
+/// The checks the API runs on a scoreboard or a left payload, so that one it would refuse is neither kept nor sent.
 pub fn check_live_match(payload: &Value, now: i64) -> Result<(), &'static str> {
+    if payload.get("left").is_some() { check_left_match(payload, now) } else { check_ended_match(payload, now) }
+}
+
+fn check_ended_match(payload: &Value, now: i64) -> Result<(), &'static str> {
     let state = &payload["state"];
     let end = &payload["end"];
     let game = &state["Game"];
-    let guid = state["MatchGuid"].as_str().unwrap_or_default();
+    let guid = match_guid(state);
     let winner_team = team_number(&end["WinnerTeamNum"]);
-    if guid.trim().is_empty()
-        || utf16_len(guid) > 128
-        || end["MatchGuid"].as_str() != Some(guid)
-        || winner_team.is_none()
-    {
+    if guid.is_none() || end["MatchGuid"].as_str() != guid || winner_team.is_none() {
         return Err("Fin de match absente ou incohérente.");
     }
-    let (Some(started), Some(ended)) = (integer(&payload["startedAt"]), integer(&payload["endedAt"])) else {
+    check_dates(payload, "endedAt", now)?;
+    let count = player_count(&game["PlaylistId"]);
+    let Some(count) = count.filter(|_| game["bHasWinner"] == true && game["bReplay"] == false) else {
+        return Err("Match public terminé requis.");
+    };
+    let teams = check_teams(game)?;
+    let winner = teams.iter().find(|team| team_number(&team["TeamNum"]) == winner_team);
+    if winner.map(|team| &team["Name"]) != Some(&game["Winner"]) {
+        return Err("Gagnant du tableau différent de la fin de match.");
+    }
+    // After a forfeit the losers often leave at once: the scoreboard keeps whoever is still identified.
+    check_players(payload, count)
+}
+
+/// A left payload: the last scoreboard of a public match the sender left before its end, with no winner.
+fn check_left_match(payload: &Value, now: i64) -> Result<(), &'static str> {
+    let state = &payload["state"];
+    let game = &state["Game"];
+    if payload["left"] != true || payload.get("end").is_some() || payload.get("endedAt").is_some() {
+        return Err("Départ du match incohérent.");
+    }
+    if match_guid(state).is_none() {
+        return Err("Match absent ou incohérent.");
+    }
+    check_dates(payload, "leftAt", now)?;
+    let count = player_count(&game["PlaylistId"]);
+    let Some(count) = count.filter(|_| game["bReplay"] == false && game.get("bHasWinner").is_none()) else {
+        return Err("Match public en cours requis.");
+    };
+    check_teams(game)?;
+    check_players(payload, count)
+}
+
+fn match_guid(state: &Value) -> Option<&str> {
+    state["MatchGuid"].as_str().filter(|guid| !guid.trim().is_empty() && utf16_len(guid) <= 128)
+}
+
+/// `startedAt` and the end or departure date: in order, three hours apart at most, within the last day.
+fn check_dates(payload: &Value, key: &str, now: i64) -> Result<(), &'static str> {
+    let (Some(started), Some(ended)) = (integer(&payload["startedAt"]), integer(&payload[key])) else {
         return Err("Date du match invalide.");
     };
     if started > ended || ended - started > 10_800_000 || ended > now + 30_000 || ended < now - 86_400_000 {
         return Err("Date du match invalide.");
     }
-    let count = player_count(&game["PlaylistId"]);
-    let Some(count) = count.filter(|_| game["bHasWinner"] == true && game["bReplay"] == false) else {
-        return Err("Match public terminé requis.");
-    };
+    Ok(())
+}
+
+fn check_teams(game: &Value) -> Result<&[Value], &'static str> {
     let teams = game["Teams"].as_array().map(Vec::as_slice).unwrap_or_default();
     let valid_team = |team: &Value| {
         team_number(&team["TeamNum"]).is_some()
@@ -540,12 +600,12 @@ pub fn check_live_match(payload: &Value, now: i64) -> Result<(), &'static str> {
     {
         return Err("Équipes finales invalides.");
     }
-    let winner = teams.iter().find(|team| team_number(&team["TeamNum"]) == winner_team);
-    if winner.map(|team| &team["Name"]) != Some(&game["Winner"]) {
-        return Err("Gagnant du tableau différent de la fin de match.");
-    }
-    // After a forfeit the losers often leave at once: the scoreboard keeps whoever is still identified.
-    let players = state["Players"].as_array().map(Vec::as_slice).unwrap_or_default();
+    Ok(teams)
+}
+
+/// The scoreboard's identified players and `seenIds`, for a playlist of `count` players.
+fn check_players(payload: &Value, count: usize) -> Result<(), &'static str> {
+    let players = payload["state"]["Players"].as_array().map(Vec::as_slice).unwrap_or_default();
     let seen = payload["seenIds"].as_array().map(Vec::as_slice).unwrap_or_default();
     if players.is_empty() || players.len() > count || seen.len() != players.len() || !payload["seenIds"].is_array() {
         return Err("Aucun joueur identifié dans le tableau final.");
@@ -628,11 +688,27 @@ pub mod tests_support {
             "seenIds": seen
         })
     }
+
+    /// The left payload of the same match: its last scoreboard without a winner, sent when the player left.
+    pub fn left_payload(guid: &str) -> Value {
+        let ended = payload(guid);
+        let mut game = ended["state"]["Game"].clone();
+        let game = game.as_object_mut().unwrap();
+        game.remove("bHasWinner");
+        game.remove("Winner");
+        json!({
+            "left": true,
+            "state": { "MatchGuid": guid, "Players": ended["state"]["Players"], "Game": game },
+            "startedAt": NOW - 360_000,
+            "leftAt": NOW - 1000,
+            "seenIds": ended["seenIds"]
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::tests_support::{NOW, payload};
+    use super::tests_support::{NOW, left_payload, payload};
     use super::*;
     use serde_json::json;
 
@@ -906,11 +982,13 @@ mod tests {
         assert_eq!(sent.map(|sent| sent.to_string()), Some(dated(p.clone()).to_string()));
         assert!(capture.in_match());
 
-        // Without MatchEnded, leaving sends nothing.
+        // Without MatchEnded, leaving sends the left payload, never a scoreboard with a winner.
         let mut capture = MatchCapture::default();
         capture.handle(&packet("MatchCreated", guid.clone()), NOW);
         capture.handle(&packet("UpdateState", playing(&p)), NOW);
-        assert_eq!(capture.handle(&packet("MatchDestroyed", guid), NOW), None);
+        let sent = capture.handle(&packet("MatchDestroyed", guid), NOW).unwrap();
+        assert_eq!(sent["left"], true);
+        assert_eq!(sent.get("end"), None);
     }
 
     /// A match whose last update before the end shows 143 seconds left, then `after` once it ended.
@@ -1125,6 +1203,129 @@ mod tests {
         let names: Vec<&str> =
             sent["departures"].as_array().unwrap().iter().map(|d| d["Name"].as_str().unwrap()).collect();
         assert_eq!(names, (1..=8).map(|index| format!("Guest {index}")).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sends_the_left_payload_when_the_match_is_left_before_its_end() {
+        let p = payload("left-early");
+        let guid = json!({ "MatchGuid": "left-early" });
+        let start = |capture: &mut MatchCapture| {
+            capture.handle(&packet("MatchCreated", guid.clone()), NOW - 300_000);
+            capture.handle(&packet("UpdateState", playing(&p)), NOW - 200_000);
+            let mut later = playing(&p);
+            later["Players"][0]["Score"] = json!(180);
+            later["Game"]["TimeSeconds"] = json!(97);
+            capture.handle(&packet("UpdateState", later), NOW - 100_000)
+        };
+        let mut players = p["state"]["Players"].clone();
+        players[0]["Score"] = json!(180);
+        let expected = json!({
+            "left": true,
+            "state": {
+                "MatchGuid": "left-early",
+                "Players": players,
+                "Game": { "PlaylistId": 13, "Teams": p["state"]["Game"]["Teams"], "bReplay": false }
+            },
+            "startedAt": NOW - 300_000,
+            "leftAt": NOW,
+            "seenIds": p["seenIds"]
+        });
+
+        let mut capture = MatchCapture::default();
+        assert_eq!(start(&mut capture), None);
+        let sent = capture.handle(&packet("MatchDestroyed", guid.clone()), NOW).unwrap();
+        assert_eq!(sent.to_string(), expected.to_string());
+        assert_eq!(check_live_match(&sent, NOW), Ok(()));
+        assert!(!capture.in_match());
+
+        // Another match starts: the left payload goes, and the new match is followed.
+        for event in ["MatchCreated", "MatchInitialized"] {
+            let mut capture = MatchCapture::default();
+            start(&mut capture);
+            let sent = capture.handle(&packet(event, json!({ "MatchGuid": "next" })), NOW);
+            assert_eq!(sent.map(|sent| sent.to_string()), Some(expected.to_string()), "{event}");
+            assert!(capture.in_match());
+        }
+
+        // The game closes.
+        let mut capture = MatchCapture::default();
+        start(&mut capture);
+        assert_eq!(capture.finish(NOW).map(|sent| sent.to_string()), Some(expected.to_string()));
+    }
+
+    #[test]
+    fn no_left_payload_for_a_replay_a_private_match_a_match_joined_late_or_one_that_ended() {
+        let guid = json!({ "MatchGuid": "not-left" });
+        let leave = |prepare: &dyn Fn(&mut MatchCapture), state: Value| {
+            let mut capture = MatchCapture::default();
+            prepare(&mut capture);
+            capture.handle(&packet("UpdateState", state), NOW);
+            capture.handle(&packet("MatchDestroyed", guid.clone()), NOW)
+        };
+        let created = |capture: &mut MatchCapture| {
+            capture.handle(&packet("MatchCreated", guid.clone()), NOW);
+        };
+        let p = payload("not-left");
+        let mut replay = playing(&p);
+        replay["Game"]["bReplay"] = json!(true);
+        assert_eq!(leave(&created, replay), None, "replayed updates");
+        let replay_created = |capture: &mut MatchCapture| {
+            capture.handle(&packet("ReplayCreated", guid.clone()), NOW);
+            capture.handle(&packet("MatchCreated", guid.clone()), NOW);
+        };
+        assert_eq!(leave(&replay_created, playing(&p)), None, "replay");
+        for playlist in [json!(6), json!(40), Value::Null] {
+            let mut private = playing(&p);
+            private["Game"]["PlaylistId"] = playlist.clone();
+            assert_eq!(leave(&created, private), None, "{playlist}");
+        }
+        assert_eq!(leave(&|_| {}, playing(&p)), None, "joined late");
+        assert_eq!(leave(&created, keep_players(&playing(&p), 0)), None, "nobody identified");
+
+        // A match that ended normally sent its scoreboard: leaving it sends nothing more.
+        let mut capture = MatchCapture::default();
+        let mut received = Vec::new();
+        created(&mut capture);
+        received.extend(capture.handle(&packet("UpdateState", playing(&p)), NOW));
+        finish(&mut capture, &p, &mut received);
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].get("left"), None);
+        assert_eq!(capture.handle(&packet("MatchDestroyed", guid.clone()), NOW), None);
+        assert_eq!(capture.finish(NOW), None);
+    }
+
+    #[test]
+    fn validation_accepts_the_left_payload_and_refuses_a_broken_one() {
+        assert_eq!(check_live_match(&left_payload("left"), NOW), Ok(()));
+        let mutations: Vec<fn(&mut Value)> = vec![
+            |p| p["left"] = json!(false),
+            |p| p["left"] = json!("true"),
+            |p| p["end"] = json!({ "MatchGuid": "left", "WinnerTeamNum": 1 }),
+            |p| p["endedAt"] = json!(NOW),
+            |p| _ = p.as_object_mut().unwrap().remove("leftAt"),
+            |p| p["leftAt"] = json!(NOW - 400_000),
+            |p| p["leftAt"] = json!(NOW + 60_000),
+            |p| p["leftAt"] = json!(NOW - 86_400_001),
+            |p| p["state"]["MatchGuid"] = json!(" "),
+            |p| p["state"]["Game"]["bReplay"] = json!(true),
+            |p| _ = p["state"]["Game"].as_object_mut().unwrap().remove("bReplay"),
+            |p| p["state"]["Game"]["bHasWinner"] = json!(true),
+            |p| p["state"]["Game"]["PlaylistId"] = json!(6),
+            |p| _ = p["state"]["Game"]["Teams"].as_array_mut().unwrap().pop(),
+            |p| {
+                p["state"]["Players"] = json!([]);
+                p["seenIds"] = json!([]);
+            },
+            |p| _ = p["seenIds"].as_array_mut().unwrap().pop(),
+            |p| p["state"]["Players"][0]["PrimaryId"] = json!("Bot|1|0"),
+            |p| p["state"]["Players"][3]["TeamNum"] = json!(0),
+            |p| p["state"]["Players"][0]["Name"] = json!(""),
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut p = left_payload("left");
+            mutate(&mut p);
+            assert!(check_live_match(&p, NOW).is_err(), "mutation {index}");
+        }
     }
 
     #[test]

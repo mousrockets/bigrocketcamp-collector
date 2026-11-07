@@ -55,9 +55,11 @@ impl Queue {
     }
 
     /// Keeps a new scoreboard, replacing an older one of the same match; returns false when the oldest was dropped.
+    /// A left payload never replaces the match's final scoreboard: the API ignores a departure once it has a result.
     pub fn add(&mut self, payload: Value) -> bool {
         let guid = &payload["state"]["MatchGuid"];
         match self.items.iter().position(|queued| &queued["state"]["MatchGuid"] == guid) {
+            Some(index) if is_left(&payload) && !is_left(&self.items[index]) => return true,
             Some(index) => self.items[index] = payload,
             None => self.items.push(payload),
         }
@@ -128,10 +130,14 @@ impl Queue {
     }
 }
 
+fn is_left(payload: &Value) -> bool {
+    payload["left"] == true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::tests_support::{NOW, payload};
+    use crate::capture::tests_support::{NOW, left_payload, payload};
 
     fn queue(name: &str) -> Queue {
         let path = std::env::temp_dir().join(format!("brc-collector-{name}-{}.json", std::process::id()));
@@ -228,6 +234,46 @@ mod tests {
         assert!(!q.add(payload("one-too-many")));
         assert_eq!(q.len(), MAX_QUEUE);
         assert_eq!(q.items[0]["state"]["MatchGuid"], "match-1");
+        let _ = fs::remove_file(&q.path);
+    }
+
+    #[test]
+    fn queues_sends_and_drops_a_left_payload_like_a_match() {
+        let mut q = queue("left");
+        q.add(left_payload("left-match"));
+        q.add(left_payload("refused-left"));
+        assert_eq!(Queue::load(q.path.clone(), NOW).len(), 2);
+        let mut bodies = Vec::new();
+        let mut events = Vec::new();
+        let next = q.upload(
+            NOW,
+            |body| {
+                bodies.push(body.to_owned());
+                if body.contains("refused-left") {
+                    Some((403, r#"{"error":"Aucun joueur du membre."}"#.into()))
+                } else {
+                    receipt("left-match")
+                }
+            },
+            |event| events.push(event),
+        );
+        assert_eq!(next, Next::Idle);
+        assert_eq!(bodies[0], left_payload("left-match").to_string());
+        assert_eq!(events, [Event::Received, Event::Dropped("Aucun joueur du membre.".into())]);
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn the_final_scoreboard_wins_over_a_left_payload_of_the_same_match() {
+        let mut q = queue("left-then-ended");
+        q.add(left_payload("came-back"));
+        q.add(payload("came-back"));
+        assert_eq!(q.items, [payload("came-back")]);
+        q.add(left_payload("came-back"));
+        assert_eq!(q.items, [payload("came-back")]);
+        q.add(left_payload("other"));
+        q.add(left_payload("other"));
+        assert_eq!(q.len(), 2);
         let _ = fs::remove_file(&q.path);
     }
 
