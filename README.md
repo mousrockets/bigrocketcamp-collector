@@ -89,6 +89,7 @@ Content-Type: application/json
 - `state.Players` ne contient que les joueurs qui ont un identifiant valide : au moins un, au plus le nombre de joueurs de la playlist, et la moitié au plus par équipe. Les bots et les joueurs partis après un forfait en sont absents.
 - `seenIds` contient les identifiants de ces mêmes joueurs, dans l'ordre où le collecteur les a vus.
 - Le gagnant vient de `MatchEnded` : `Game.bHasWinner` vaut `true` et `Game.Winner` est le nom de l'équipe `WinnerTeamNum`.
+- `Game.TimeSeconds` et `Game.bOvertime` sont l'horloge de la dernière mise à jour avant `MatchEnded` : du temps restant hors prolongation, c'est un forfait des perdants. Une mise à jour après la fin ne peut que baisser le temps restant. Absents si le jeu ne les envoie pas.
 - Le collecteur envoie le tableau dès qu'il reçoit deux fois de suite le même après `MatchEnded`. Sinon, il envoie le dernier tableau connu du match quand le joueur le quitte, quand un autre match commence ou quand le jeu se ferme.
 - Sans cookie ni en-tête `Origin` : avec un jeton `Bearer`, la route ne doit pas exiger la même origine. Elle vérifie toujours que le tableau contient un identifiant de jeu du membre du jeton.
 - `200` : `{"ok":true,"match":"<MatchGuid sans espaces, en minuscules>"}`. Sans cette confirmation exacte, le match reste dans la file.
