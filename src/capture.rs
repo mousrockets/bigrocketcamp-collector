@@ -9,6 +9,7 @@ const MAX_BUFFER: usize = 262_144;
 const MAX_MESSAGES: usize = 100;
 const MAX_BLOCKED: usize = 30;
 const MAX_SEEN: usize = 16;
+const MAX_DEPARTURES: usize = 8;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct StreamError(pub &'static str);
@@ -117,6 +118,10 @@ struct CurrentMatch {
     clock: Map<String, Value>,
     /// The clock's changes around `MatchEnded`, as `trace_clock` keeps them.
     trace: Vec<Value>,
+    /// Every identified player of the usable updates before `MatchEnded`, first seen first, with his last values.
+    players: Vec<Value>,
+    /// The canonical ids of the last usable update before `MatchEnded`: whoever is missing from it left.
+    present: Vec<String>,
     sent: bool,
 }
 
@@ -184,6 +189,8 @@ impl MatchCapture {
                 last: None,
                 clock: Map::new(),
                 trace: Vec::new(),
+                players: Vec::new(),
+                present: Vec::new(),
                 sent: false,
             });
             return previous;
@@ -218,6 +225,9 @@ impl MatchCapture {
             current.last = Some(state.clone());
             keep_clock(&mut current.clock, &data["Game"], current.end.is_some());
             trace_clock(&mut current.trace, &data["Game"], current.end.is_some());
+            if current.end.is_none() {
+                remember_players(current, state);
+            }
         }
         current.end.as_ref()?;
         let Some(payload) = usable.and_then(|state| scoreboard(current, state)) else {
@@ -290,7 +300,37 @@ fn scoreboard(current: &CurrentMatch, state: &Value) -> Option<Value> {
     if !current.trace.is_empty() {
         payload.insert("clockTrace".into(), Value::Array(current.trace.clone()));
     }
+    let departures = departures(current);
+    if !departures.is_empty() {
+        payload.insert("departures".into(), Value::Array(departures));
+    }
     Some(Value::Object(payload))
+}
+
+/// Remembers the players of a usable update before `MatchEnded`, and which of them are still there.
+fn remember_players(current: &mut CurrentMatch, state: &Value) {
+    let players = state["Players"].as_array().map(Vec::as_slice).unwrap_or_default();
+    current.present = players.iter().map(|player| canonical(&player["PrimaryId"])).collect();
+    for player in players {
+        let id = canonical(&player["PrimaryId"]);
+        match current.players.iter_mut().find(|known| canonical(&known["PrimaryId"]) == id) {
+            Some(known) => *known = player.clone(),
+            None => current.players.push(player.clone()),
+        }
+    }
+}
+
+/// The players who left before `MatchEnded`, with their last values: the API counts a defeat for a club player who
+/// left, and a forfeit when every opponent did. Leaving during the podium changes nothing, so a player missing only
+/// after the end is not one of them.
+fn departures(current: &CurrentMatch) -> Vec<Value> {
+    current
+        .players
+        .iter()
+        .filter(|player| !current.present.contains(&canonical(&player["PrimaryId"])))
+        .take(MAX_DEPARTURES)
+        .map(|player| pick(player, &DEPARTURE_FIELDS))
+        .collect()
 }
 
 /// The clock of the last update before `MatchEnded`, which the API reads a forfeit from. The tick that reaches 0:00
@@ -379,6 +419,7 @@ fn final_state(guid: &str, data: &Value) -> Option<Value> {
 
 const PLAYER_FIELDS: [&str; 7] = ["Name", "PrimaryId", "TeamNum", "Score", "Goals", "Assists", "Saves"];
 const TEAM_FIELDS: [&str; 3] = ["Name", "TeamNum", "Score"];
+const DEPARTURE_FIELDS: [&str; 7] = ["PrimaryId", "Name", "TeamNum", "Score", "Goals", "Assists", "Saves"];
 
 fn pick(source: &Value, keys: &[&str]) -> Value {
     let mut picked = Map::new();
@@ -979,6 +1020,111 @@ mod tests {
         assert_eq!(received[0]["clockTrace"], Value::Array(trace));
         assert_eq!(received[0]["state"]["Game"]["TimeSeconds"], 140);
         assert_eq!(check_live_match(&received[0], NOW), Ok(()));
+    }
+
+    fn without(state: &Value, index: usize) -> Value {
+        let mut state = state.clone();
+        state["Players"].as_array_mut().unwrap().remove(index);
+        state
+    }
+
+    /// The scoreboard of a match created, played through `before`, ended, then followed by two identical `after`.
+    fn ended_after(guid: &str, before: &[Value], after: &Value) -> Value {
+        let p = payload(guid);
+        let mut capture = MatchCapture::default();
+        let mut received = Vec::new();
+        capture.handle(&packet("MatchCreated", json!({ "MatchGuid": guid })), NOW);
+        for state in before {
+            received.extend(capture.handle(&packet("UpdateState", state.clone()), NOW));
+        }
+        capture.handle(&packet("MatchEnded", p["end"].clone()), NOW);
+        for _ in 0..2 {
+            received.extend(capture.handle(&packet("UpdateState", after.clone()), NOW));
+        }
+        assert_eq!(received.len(), 1);
+        received.remove(0)
+    }
+
+    #[test]
+    fn nobody_left_keeps_the_body_byte_for_byte() {
+        let p = payload("all-there");
+        let sent = ended_after("all-there", &[playing(&p), without(&playing(&p), 2), playing(&p)], &p["state"]);
+        assert_eq!(sent.to_string(), dated(p).to_string());
+    }
+
+    #[test]
+    fn a_club_player_who_left_before_the_end_is_a_departure() {
+        let p = payload("left-mid-match");
+        let mut before = playing(&p);
+        before["Players"][2]["Score"] = json!(150);
+        let last = without(&p["state"], 2);
+        let sent = ended_after("left-mid-match", &[before, without(&playing(&p), 2)], &last);
+        let mut expected = dated(p.clone());
+        expected["state"] = last;
+        expected["seenIds"].as_array_mut().unwrap().remove(2);
+        let departure = r#"{"PrimaryId":"PS4|222222|0","Name":"Friend Two","TeamNum":0,"Score":150,"Goals":0,"Assists":0,"Saves":1}"#;
+        let body = expected.to_string();
+        assert_eq!(sent.to_string(), format!(r#"{},"departures":[{departure}]}}"#, &body[..body.len() - 1]));
+        assert_eq!(check_live_match(&sent, NOW), Ok(()));
+    }
+
+    #[test]
+    fn a_player_who_came_back_or_left_during_the_podium_is_not_a_departure() {
+        let p = payload("came-back");
+        let came_back = ended_after("came-back", &[playing(&p), without(&playing(&p), 4), playing(&p)], &p["state"]);
+        assert_eq!(came_back.get("departures"), None);
+        let podium = ended_after("came-back", &[playing(&p)], &without(&p["state"], 1));
+        assert_eq!(podium.get("departures"), None);
+        assert_eq!(podium["state"]["Players"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn opponents_gone_before_the_end_are_all_departures() {
+        // A 2v2: both opponents quit, the club wins the forfeit, and the scoreboard goes when the match is left.
+        let mut p = payload("opponents-gone");
+        p["state"]["Game"]["PlaylistId"] = json!(11);
+        let players = p["state"]["Players"].as_array_mut().unwrap();
+        players.remove(5);
+        players.remove(2);
+        let guid = json!({ "MatchGuid": "opponents-gone" });
+        let end = json!({ "MatchGuid": "opponents-gone", "WinnerTeamNum": 0 });
+        let mut capture = MatchCapture::default();
+        capture.handle(&packet("MatchCreated", guid.clone()), NOW);
+        capture.handle(&packet("UpdateState", playing(&p)), NOW);
+        capture.handle(&packet("UpdateState", without(&playing(&p), 3)), NOW);
+        capture.handle(&packet("UpdateState", without(&without(&playing(&p), 3), 2)), NOW);
+        capture.handle(&packet("MatchEnded", end), NOW);
+        let sent = capture.handle(&packet("MatchDestroyed", guid), NOW).unwrap();
+        assert_eq!(sent["state"]["Players"].as_array().unwrap().len(), 2);
+        let opponents: Vec<Value> = p["state"]["Players"].as_array().unwrap()[2..]
+            .iter()
+            .map(|player| pick(player, &DEPARTURE_FIELDS))
+            .collect();
+        assert_eq!(sent["departures"], Value::Array(opponents));
+        assert_eq!(sent["departures"][0]["TeamNum"], 1);
+        assert_eq!(check_live_match(&sent, NOW), Ok(()));
+    }
+
+    #[test]
+    fn keeps_eight_departures_at_most_first_seen_first() {
+        let p = payload("rotation");
+        let own = p["state"]["Players"][0].clone();
+        let guest = |index: usize| {
+            json!({ "Name": format!("Guest {index}"), "PrimaryId": format!("Steam|{index}|0"), "TeamNum": 1,
+                    "Score": 0, "Goals": 0, "Assists": 0, "Saves": 0 })
+        };
+        let mut before: Vec<Value> = (1..=10)
+            .map(|index| {
+                let mut state = playing(&p);
+                state["Players"] = json!([own, guest(index)]);
+                state
+            })
+            .collect();
+        before.push(keep_players(&playing(&p), 1));
+        let sent = ended_after("rotation", &before, &keep_players(&p["state"], 1));
+        let names: Vec<&str> =
+            sent["departures"].as_array().unwrap().iter().map(|d| d["Name"].as_str().unwrap()).collect();
+        assert_eq!(names, (1..=8).map(|index| format!("Guest {index}")).collect::<Vec<_>>());
     }
 
     #[test]
