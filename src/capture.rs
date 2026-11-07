@@ -113,6 +113,8 @@ struct CurrentMatch {
     candidate: Option<String>,
     /// The last scoreboard of this match outside a replay with at least one identified player.
     last: Option<Value>,
+    /// `TimeSeconds` and `bOvertime` as `keep_clock` keeps them.
+    clock: Map<String, Value>,
     sent: bool,
 }
 
@@ -178,6 +180,7 @@ impl MatchCapture {
                 ended_at: None,
                 candidate: None,
                 last: None,
+                clock: Map::new(),
                 sent: false,
             });
             return previous;
@@ -210,6 +213,7 @@ impl MatchCapture {
         });
         if let Some(state) = usable {
             current.last = Some(state.clone());
+            keep_clock(&mut current.clock, &data["Game"], current.end.is_some());
         }
         current.end.as_ref()?;
         let Some(payload) = usable.and_then(|state| scoreboard(current, state)) else {
@@ -256,6 +260,11 @@ fn scoreboard(current: &CurrentMatch, state: &Value) -> Option<Value> {
     game.insert("bHasWinner".into(), Value::Bool(true));
     copy(&mut game, source, "bReplay");
     game.insert("Winner".into(), winner.clone());
+    for key in ["TimeSeconds", "bOvertime"] {
+        if let Some(value) = current.clock.get(key) {
+            game.insert(key.into(), value.clone());
+        }
+    }
     let mut state = state.clone();
     state["Game"] = Value::Object(game);
     let ids: Vec<String> = state["Players"].as_array()?.iter().map(|player| canonical(&player["PrimaryId"])).collect();
@@ -275,6 +284,25 @@ fn scoreboard(current: &CurrentMatch, state: &Value) -> Option<Value> {
     payload.insert("endedAt".into(), current.ended_at.map_or(Value::Null, Value::from));
     payload.insert("seenIds".into(), Value::Array(seen));
     Some(Value::Object(payload))
+}
+
+/// The clock of the last update before `MatchEnded`, which the API reads a forfeit from. An update after the end
+/// can only lower the time left: the tick that reached 0:00 may arrive after `MatchEnded`.
+fn keep_clock(kept: &mut Map<String, Value>, game: &Value, ended: bool) {
+    if !ended {
+        kept.clear();
+        copy(kept, game, "TimeSeconds");
+        copy(kept, game, "bOvertime");
+        return;
+    }
+    if let Some(seen) = game.get("TimeSeconds").filter(|seen| seen.is_number())
+        && kept.get("TimeSeconds").and_then(Value::as_f64).is_none_or(|time| seen.as_f64() < Some(time))
+    {
+        kept.insert("TimeSeconds".into(), seen.clone());
+    }
+    if !kept.contains_key("bOvertime") {
+        copy(kept, game, "bOvertime");
+    }
 }
 
 /// The fields of an update kept in the scoreboard, in the browser's order, without the players who have no
@@ -616,7 +644,7 @@ mod tests {
         capture.handle(&packet("MatchCreated", json!({ "MatchGuid": "same-json" })), NOW);
         let mut noisy = p["state"].clone();
         noisy["Players"][0]["Touches"] = json!(12);
-        noisy["Game"]["TimeSeconds"] = json!(0);
+        noisy["Game"]["Clock"] = json!("0:00");
         noisy["Game"]["Teams"][0]["ColorPrimary"] = json!("1873FF");
         received.extend(capture.handle(&packet("MatchEnded", p["end"].clone()), NOW));
         received.extend(capture.handle(&packet("UpdateState", noisy.clone()), NOW));
@@ -801,6 +829,67 @@ mod tests {
         capture.handle(&packet("MatchCreated", guid.clone()), NOW);
         capture.handle(&packet("UpdateState", playing(&p)), NOW);
         assert_eq!(capture.handle(&packet("MatchDestroyed", guid), NOW), None);
+    }
+
+    /// A match whose last update before the end shows 143 seconds left, then `after` once it ended.
+    fn clock_sent(after: Value) -> Value {
+        let p = payload("clock");
+        let mut capture = MatchCapture::default();
+        let mut received = Vec::new();
+        capture.handle(&packet("MatchCreated", json!({ "MatchGuid": "clock" })), NOW);
+        let mut before = p["state"].clone();
+        before["Game"]["TimeSeconds"] = json!(143);
+        before["Game"]["bOvertime"] = json!(false);
+        capture.handle(&packet("UpdateState", before), NOW);
+        capture.handle(&packet("MatchEnded", p["end"].clone()), NOW);
+        let mut last = p["state"].clone();
+        for (key, value) in after.as_object().unwrap() {
+            last["Game"][key] = value.clone();
+        }
+        for _ in 0..2 {
+            received.extend(capture.handle(&packet("UpdateState", last.clone()), NOW));
+        }
+        assert_eq!(received.len(), 1);
+        received.remove(0)
+    }
+
+    #[test]
+    fn sends_the_clock_of_the_last_update_before_the_end() {
+        let sent = clock_sent(json!({ "TimeSeconds": 300, "bOvertime": false }));
+        let game = r#""bHasWinner":true,"bReplay":false,"Winner":"Orange","TimeSeconds":143,"bOvertime":false}"#;
+        assert!(sent.to_string().contains(game), "{sent}");
+        assert_eq!(check_live_match(&sent, NOW), Ok(()));
+        // The tick that reached 0:00 after MatchEnded lowers the time left; overtime stays as it was before the end.
+        let sent = clock_sent(json!({ "TimeSeconds": 0, "bOvertime": true }));
+        assert_eq!(sent["state"]["Game"]["TimeSeconds"], 0);
+        assert_eq!(sent["state"]["Game"]["bOvertime"], false);
+        // An update after the end without the clock keeps the one before it.
+        let sent = clock_sent(json!({}));
+        assert_eq!(sent["state"]["Game"]["TimeSeconds"], 143);
+        // A game that sends no clock at all: the scoreboard has none either, byte for byte as before.
+        let mut capture = MatchCapture::default();
+        let p = payload("no-clock");
+        capture.handle(&packet("MatchCreated", json!({ "MatchGuid": "no-clock" })), NOW);
+        capture.handle(&packet("UpdateState", playing(&p)), NOW);
+        capture.handle(&packet("MatchEnded", p["end"].clone()), NOW);
+        let sent = capture.handle(&packet("MatchDestroyed", json!({ "MatchGuid": "no-clock" })), NOW).unwrap();
+        assert_eq!(sent.to_string(), dated(p).to_string());
+    }
+
+    #[test]
+    fn a_forfeit_sends_the_time_left_when_the_match_is_left() {
+        let p = payload("forfeit-clock");
+        let guid = json!({ "MatchGuid": "forfeit-clock" });
+        let mut capture = MatchCapture::default();
+        capture.handle(&packet("MatchCreated", guid.clone()), NOW);
+        let mut before = playing(&p);
+        before["Game"]["TimeSeconds"] = json!(97);
+        before["Game"]["bOvertime"] = json!(false);
+        capture.handle(&packet("UpdateState", before), NOW);
+        capture.handle(&packet("MatchEnded", p["end"].clone()), NOW);
+        let sent = capture.handle(&packet("MatchDestroyed", guid), NOW).unwrap();
+        assert_eq!(sent["state"]["Game"]["TimeSeconds"], 97);
+        assert_eq!(sent["state"]["Game"]["bOvertime"], false);
     }
 
     #[test]
