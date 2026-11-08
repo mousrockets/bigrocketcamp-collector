@@ -1,0 +1,38 @@
+# Deletes the branches of merged pull requests. The repository's « Automatically delete head branches » setting does
+# not act on merges made by GitHub's auto-merge when the auto-merge workflow turned it on, and a merge made with the
+# Actions token starts no `pull_request: closed` workflow either. So this sweeps: once the auto-merge workflow ends
+# (its own completion does start workflows), and every hour for a merge that landed after it ended.
+# A branch is deleted only while it still points at the commit its pull request merged, with no open pull request.
+name: Delete merged branches
+
+on:
+  workflow_run:
+    workflows: [Auto-merge]
+    types: [completed]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # GitHub merges a few seconds after the auto-merge workflow turns auto-merge on.
+          if [ "${{ github.event_name }}" = workflow_run ]; then sleep 30; fi
+          gh pr list --state merged --limit 50 --json headRefName,headRefOid,isCrossRepository \
+            --jq '.[] | select(.isCrossRepository | not) | "\(.headRefName) \(.headRefOid)"' |
+          while read -r branch merged; do
+            [ "$branch" = main ] && continue
+            tip=$(gh api "repos/$GH_REPO/git/ref/heads/$branch" --jq .object.sha 2>/dev/null) || continue
+            [ "$tip" = "$merged" ] || continue
+            [ -z "$(gh pr list --state open --head "$branch" --json number --jq '.[].number')" ] || continue
+            gh api -X DELETE "repos/$GH_REPO/git/refs/heads/$branch" && echo "Deleted $branch"
+          done
