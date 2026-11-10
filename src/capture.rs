@@ -970,7 +970,7 @@ mod tests {
         received.extend(capture.handle(&packet("MatchDestroyed", guid.clone()), NOW));
         assert_eq!(received.len(), 1);
         let sent = &received[0];
-        assert_eq!(sent["state"]["Players"], keep_players(&p["state"], 2)["Players"]);
+        assert_eq!(sent["state"]["Players"], unhit(keep_players(&p["state"], 2))["Players"]);
         assert_eq!(sent["seenIds"], json!(p["seenIds"].as_array().unwrap()[..2]));
         assert_eq!(sent["state"]["Game"]["bHasWinner"], true);
         assert_eq!(sent["state"]["Game"]["Winner"], "Blue");
@@ -1008,7 +1008,7 @@ mod tests {
                 received.extend(capture.handle(&packet("UpdateState", replaced.clone()), NOW));
             }
             assert_eq!(received.len(), 1, "{bot}");
-            assert_eq!(received[0]["state"]["Players"], keep_players(&p["state"], 5)["Players"]);
+            assert_eq!(received[0]["state"]["Players"], unhit(keep_players(&p["state"], 5))["Players"]);
             assert_eq!(received[0]["seenIds"], json!(p["seenIds"].as_array().unwrap()[..5]));
         }
         // A missing player entry is ignored too, instead of dropping the match.
