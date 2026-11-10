@@ -123,6 +123,10 @@ struct CurrentMatch {
     /// The canonical ids of the last usable update before `MatchEnded`: whoever is missing from it left.
     present: Vec<String>,
     sent: bool,
+    /// Each identified player's `PrimaryId` by the shortcut and team the game names him with in its events.
+    shortcuts: Vec<(String, String)>,
+    /// The crossbar or post hits of each identified player before `MatchEnded`, by his `PrimaryId`.
+    crossbars: Vec<(String, u64)>,
 }
 
 impl CurrentMatch {
@@ -201,10 +205,18 @@ impl MatchCapture {
                 players: Vec::new(),
                 present: Vec::new(),
                 sent: false,
+                shortcuts: Vec::new(),
+                crossbars: Vec::new(),
             });
             return previous;
         }
         let current = self.current.as_mut().filter(|current| current.guid == guid && !current.sent && !blocked)?;
+        if event == "CrossbarHit" {
+            if current.end.is_none() {
+                count_crossbar(current, data);
+            }
+            return None;
+        }
         if event == "MatchEnded" {
             let mut end = Map::new();
             end.insert("MatchGuid".into(), Value::String(guid.to_owned()));
@@ -225,7 +237,8 @@ impl MatchCapture {
             self.current = None;
             return None;
         }
-        let state = final_state(guid, data);
+        remember_shortcuts(current, players);
+        let state = final_state(guid, data, &current.crossbars);
         // An empty update, a replay or an unreadable one never replaces the last known scoreboard.
         let usable = state.as_ref().filter(|state| {
             state["Game"]["bReplay"] == false && state["Players"].as_array().is_some_and(|players| !players.is_empty())
@@ -418,14 +431,51 @@ fn trace_clock(trace: &mut Vec<Value>, game: &Value, ended: bool) {
     }
 }
 
+/// The game names a player in its events by a shortcut, unique within his team: `JSON.stringify` of both, as the app.
+fn shortcut_key(shortcut: Option<&Value>, team: Option<&Value>) -> String {
+    Value::Array(vec![shortcut.cloned().unwrap_or(Value::Null), team.cloned().unwrap_or(Value::Null)]).to_string()
+}
+
+/// Remembers how the game names each identified player of an update in its events.
+fn remember_shortcuts(current: &mut CurrentMatch, players: &[Value]) {
+    for player in players.iter().filter(|player| is_player_id(&player["PrimaryId"])) {
+        let key = shortcut_key(player.get("Shortcut"), player.get("TeamNum"));
+        let id = player["PrimaryId"].as_str().unwrap_or_default().to_owned();
+        match current.shortcuts.iter_mut().find(|(known, _)| *known == key) {
+            Some(entry) => entry.1 = id,
+            None => current.shortcuts.push((key, id)),
+        }
+    }
+}
+
+/// A `CrossbarHit` counts for the identified player who last touched the ball; nobody known, for nobody.
+fn count_crossbar(current: &mut CurrentMatch, data: &Value) {
+    let touch = &data["BallLastTouch"]["Player"];
+    let key = shortcut_key(touch.get("Shortcut"), touch.get("TeamNum"));
+    let Some((_, id)) = current.shortcuts.iter().find(|(known, _)| *known == key) else {
+        return;
+    };
+    let id = id.clone();
+    match current.crossbars.iter_mut().find(|(known, _)| *known == id) {
+        Some(entry) => entry.1 += 1,
+        None => current.crossbars.push((id, 1)),
+    }
+}
+
 /// The fields of an update kept in the scoreboard, in the browser's order, without the players who have no
 /// real identifier; `None` when the update is unreadable. The winner fields are added by `scoreboard`.
-fn final_state(guid: &str, data: &Value) -> Option<Value> {
+fn final_state(guid: &str, data: &Value, crossbars: &[(String, u64)]) -> Option<Value> {
     let players = data["Players"]
         .as_array()?
         .iter()
         .filter(|player| is_player_id(&player["PrimaryId"]))
-        .map(|player| pick(player, &PLAYER_FIELDS))
+        .map(|player| {
+            let mut picked = pick(player, &PLAYER_FIELDS);
+            let id = player["PrimaryId"].as_str().unwrap_or_default();
+            let hits = crossbars.iter().find(|(known, _)| known == id).map_or(0, |(_, hits)| *hits);
+            picked["CrossbarHits"] = hits.into();
+            picked
+        })
         .collect();
     let mut game = Map::new();
     let source = data.get("Game").unwrap_or(&Value::Null);
@@ -449,9 +499,11 @@ fn final_state(guid: &str, data: &Value) -> Option<Value> {
     Some(Value::Object(state))
 }
 
-const PLAYER_FIELDS: [&str; 7] = ["Name", "PrimaryId", "TeamNum", "Score", "Goals", "Assists", "Saves"];
+/// `CrossbarHits` follows them: `final_state` counts it.
+const PLAYER_FIELDS: [&str; 8] = ["Name", "PrimaryId", "TeamNum", "Score", "Goals", "Assists", "Saves", "Demos"];
 const TEAM_FIELDS: [&str; 3] = ["Name", "TeamNum", "Score"];
-const DEPARTURE_FIELDS: [&str; 7] = ["PrimaryId", "Name", "TeamNum", "Score", "Goals", "Assists", "Saves"];
+const DEPARTURE_FIELDS: [&str; 9] =
+    ["PrimaryId", "Name", "TeamNum", "Score", "Goals", "Assists", "Saves", "Demos", "CrossbarHits"];
 
 fn pick(source: &Value, keys: &[&str]) -> Value {
     let mut picked = Map::new();
@@ -730,7 +782,16 @@ mod tests {
     fn dated(mut p: Value) -> Value {
         p["startedAt"] = json!(NOW);
         p["endedAt"] = json!(NOW);
+        p["state"] = unhit(p["state"].clone());
         p
+    }
+
+    /// The capture counts the crossbar hits of every player it sends: none in these matches.
+    fn unhit(mut state: Value) -> Value {
+        for player in state["Players"].as_array_mut().unwrap() {
+            player["CrossbarHits"] = json!(0);
+        }
+        state
     }
 
     /// A state seen while the match is played: no winner yet.
@@ -818,7 +879,7 @@ mod tests {
         received.extend(capture.handle(&packet("MatchEnded", p["end"].clone()), NOW));
         received.extend(capture.handle(&packet("UpdateState", noisy.clone()), NOW));
         received.extend(capture.handle(&packet("UpdateState", noisy), NOW));
-        let player = r#"{"Name":"renamed-player","PrimaryId":"Epic|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|0","TeamNum":0,"Score":100,"Goals":0,"Assists":0,"Saves":1}"#;
+        let player = r#"{"Name":"renamed-player","PrimaryId":"Epic|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|0","TeamNum":0,"Score":100,"Goals":0,"Assists":0,"Saves":1,"CrossbarHits":0}"#;
         let teams = r#"[{"Name":"Blue","TeamNum":0,"Score":1},{"Name":"Orange","TeamNum":1,"Score":2}]"#;
         let body = received[0].to_string();
         assert!(body.starts_with(&format!(r#"{{"state":{{"MatchGuid":"same-json","Players":[{player},"#)), "{body}");
@@ -1135,6 +1196,48 @@ mod tests {
     }
 
     #[test]
+    fn counts_the_crossbar_hits_of_the_last_toucher_and_sends_the_demolitions() {
+        let p = payload("crossbars");
+        let mut state = p["state"].clone();
+        for (index, player) in state["Players"].as_array_mut().unwrap().iter_mut().enumerate() {
+            player["Shortcut"] = json!(index % 3);
+            player["Demos"] = json!(index);
+        }
+        let hit = |shortcut: u64, team: u64| {
+            packet(
+                "CrossbarHit",
+                json!({ "MatchGuid": "crossbars",
+                        "BallLastTouch": { "Player": { "Name": "x", "Shortcut": shortcut, "TeamNum": team } } }),
+            )
+        };
+        let mut capture = MatchCapture::default();
+        let mut received = Vec::new();
+        capture.handle(&packet("MatchCreated", json!({ "MatchGuid": "crossbars" })), NOW);
+        capture.handle(&packet("UpdateState", state.clone()), NOW);
+        for (shortcut, team) in [(1, 0), (1, 0), (2, 1), (7, 0)] {
+            capture.handle(&hit(shortcut, team), NOW);
+        }
+        capture.handle(&packet("MatchEnded", p["end"].clone()), NOW);
+        // After the end, a hit counts for nobody.
+        capture.handle(&hit(0, 0), NOW);
+        for _ in 0..2 {
+            received.extend(capture.handle(&packet("UpdateState", state.clone()), NOW));
+        }
+        assert_eq!(received.len(), 1);
+        let counts: Vec<(Value, Value)> = received[0]["state"]["Players"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|player| (player["Demos"].clone(), player["CrossbarHits"].clone()))
+            .collect();
+        assert_eq!(counts, [(0, 0), (1, 2), (2, 0), (3, 0), (4, 0), (5, 1)].map(|(d, c)| (json!(d), json!(c))));
+        // The same JSON as the browser: Demos after Saves, then CrossbarHits, and no Shortcut.
+        let first = received[0]["state"]["Players"][1].to_string();
+        assert!(first.ends_with(r#""Saves":1,"Demos":1,"CrossbarHits":2}"#), "{first}");
+        assert_eq!(check_live_match(&received[0], NOW), Ok(()));
+    }
+
+    #[test]
     fn nobody_left_keeps_the_body_byte_for_byte() {
         let p = payload("all-there");
         let sent = ended_after("all-there", &[playing(&p), without(&playing(&p), 2), playing(&p)], &p["state"]);
@@ -1149,9 +1252,9 @@ mod tests {
         let last = without(&p["state"], 2);
         let sent = ended_after("left-mid-match", &[before, without(&playing(&p), 2)], &last);
         let mut expected = dated(p.clone());
-        expected["state"] = last;
+        expected["state"] = unhit(last);
         expected["seenIds"].as_array_mut().unwrap().remove(2);
-        let departure = r#"{"PrimaryId":"PS4|222222|0","Name":"Friend Two","TeamNum":0,"Score":150,"Goals":0,"Assists":0,"Saves":1}"#;
+        let departure = r#"{"PrimaryId":"PS4|222222|0","Name":"Friend Two","TeamNum":0,"Score":150,"Goals":0,"Assists":0,"Saves":1,"CrossbarHits":0}"#;
         let body = expected.to_string();
         assert_eq!(sent.to_string(), format!(r#"{},"departures":[{departure}]}}"#, &body[..body.len() - 1]));
         assert_eq!(check_live_match(&sent, NOW), Ok(()));
@@ -1187,7 +1290,11 @@ mod tests {
         assert_eq!(sent["state"]["Players"].as_array().unwrap().len(), 2);
         let opponents: Vec<Value> = p["state"]["Players"].as_array().unwrap()[2..]
             .iter()
-            .map(|player| pick(player, &DEPARTURE_FIELDS))
+            .map(|player| {
+                let mut departure = pick(player, &DEPARTURE_FIELDS);
+                departure["CrossbarHits"] = json!(0);
+                departure
+            })
             .collect();
         assert_eq!(sent["departures"], Value::Array(opponents));
         assert_eq!(sent["departures"][0]["TeamNum"], 1);
@@ -1228,7 +1335,7 @@ mod tests {
             later["Game"]["TimeSeconds"] = json!(97);
             capture.handle(&packet("UpdateState", later), NOW - 100_000)
         };
-        let mut players = p["state"]["Players"].clone();
+        let mut players = unhit(p["state"].clone())["Players"].clone();
         players[0]["Score"] = json!(180);
         let expected = json!({
             "left": true,
