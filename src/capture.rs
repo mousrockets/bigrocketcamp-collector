@@ -127,6 +127,10 @@ struct CurrentMatch {
     shortcuts: Vec<(String, String)>,
     /// The crossbar or post hits of each identified player before `MatchEnded`, by his `PrimaryId`.
     crossbars: Vec<(String, u64)>,
+    /// False once the ball hit the frame, until someone touches it again: a bounce bar then post is one shot.
+    touched_since_frame: bool,
+    /// True from a goal to the next kickoff: the goal replay sends the hits of the frame again.
+    after_goal: bool,
 }
 
 impl CurrentMatch {
@@ -207,15 +211,35 @@ impl MatchCapture {
                 sent: false,
                 shortcuts: Vec::new(),
                 crossbars: Vec::new(),
+                touched_since_frame: true,
+                after_goal: false,
             });
             return previous;
         }
         let current = self.current.as_mut().filter(|current| current.guid == guid && !current.sent && !blocked)?;
-        if event == "CrossbarHit" {
-            if current.end.is_none() {
-                count_crossbar(current, data);
+        match event {
+            "BallHit" => {
+                current.touched_since_frame = true;
+                return None;
             }
-            return None;
+            "GoalScored" => {
+                current.after_goal = true;
+                return None;
+            }
+            "CountdownBegin" | "RoundStarted" => {
+                current.after_goal = false;
+                current.touched_since_frame = true;
+                return None;
+            }
+            "CrossbarHit" => {
+                let counts = current.end.is_none() && !current.after_goal && current.touched_since_frame;
+                current.touched_since_frame = false;
+                if counts {
+                    count_crossbar(current, data);
+                }
+                return None;
+            }
+            _ => {}
         }
         if event == "MatchEnded" {
             let mut end = Map::new();
@@ -448,9 +472,22 @@ fn remember_shortcuts(current: &mut CurrentMatch, players: &[Value]) {
     }
 }
 
-/// A `CrossbarHit` counts for the identified player who last touched the ball; nobody known, for nobody.
+/// The goal a team attacks: blue (0) the orange one, at positive Y; orange (1) the blue one, at negative Y.
+fn hits_opponent_goal(team: &Value, y: &Value) -> bool {
+    match (team.as_i64(), y.as_f64()) {
+        (Some(0), Some(y)) => y > 0.0,
+        (Some(1), Some(y)) => y < 0.0,
+        _ => false,
+    }
+}
+
+/// A `CrossbarHit` on the opponents' goal counts for the identified player who last touched the ball; nobody known,
+/// for nobody.
 fn count_crossbar(current: &mut CurrentMatch, data: &Value) {
     let touch = &data["BallLastTouch"]["Player"];
+    if !hits_opponent_goal(&touch["TeamNum"], &data["BallLocation"]["Y"]) {
+        return;
+    }
     let key = shortcut_key(touch.get("Shortcut"), touch.get("TeamNum"));
     let Some((_, id)) = current.shortcuts.iter().find(|(known, _)| *known == key) else {
         return;
@@ -1196,30 +1233,50 @@ mod tests {
     }
 
     #[test]
-    fn counts_the_crossbar_hits_of_the_last_toucher_and_sends_the_demolitions() {
+    fn counts_each_shot_on_the_frame_of_the_opponents_goal_and_sends_the_demolitions() {
         let p = payload("crossbars");
         let mut state = p["state"].clone();
         for (index, player) in state["Players"].as_array_mut().unwrap().iter_mut().enumerate() {
             player["Shortcut"] = json!(index % 3);
             player["Demos"] = json!(index);
         }
-        let hit = |shortcut: u64, team: u64| {
+        // Blue (0) attacks the goal at positive Y, orange (1) the one at negative Y.
+        let hit = |shortcut: u64, team: u64, y: f64| {
             packet(
                 "CrossbarHit",
-                json!({ "MatchGuid": "crossbars",
+                json!({ "MatchGuid": "crossbars", "BallLocation": { "X": 800.0, "Y": y, "Z": 640.0 },
                         "BallLastTouch": { "Player": { "Name": "x", "Shortcut": shortcut, "TeamNum": team } } }),
             )
         };
+        let event = |name: &str| packet(name, json!({ "MatchGuid": "crossbars" }));
         let mut capture = MatchCapture::default();
         let mut received = Vec::new();
-        capture.handle(&packet("MatchCreated", json!({ "MatchGuid": "crossbars" })), NOW);
+        capture.handle(&event("MatchCreated"), NOW);
         capture.handle(&packet("UpdateState", state.clone()), NOW);
-        for (shortcut, team) in [(1, 0), (1, 0), (2, 1), (7, 0)] {
-            capture.handle(&hit(shortcut, team), NOW);
-        }
+        capture.handle(&hit(1, 0, 5100.0), NOW);
+        // The ball bounces bar then post: still the same shot.
+        capture.handle(&hit(1, 0, 5100.0), NOW);
+        capture.handle(&event("BallHit"), NOW);
+        // The frame of his own goal.
+        capture.handle(&hit(1, 0, -5100.0), NOW);
+        capture.handle(&event("BallHit"), NOW);
+        capture.handle(&hit(1, 0, 5100.0), NOW);
+        capture.handle(&event("BallHit"), NOW);
+        capture.handle(&hit(2, 1, -5100.0), NOW);
+        capture.handle(&event("BallHit"), NOW);
+        // Nobody the scoreboard names: no one to count it for.
+        capture.handle(&hit(7, 0, 5100.0), NOW);
+        // The goal replay plays the hits again, touches included.
+        capture.handle(&event("GoalScored"), NOW);
+        capture.handle(&event("BallHit"), NOW);
+        capture.handle(&hit(1, 0, 5100.0), NOW);
+        capture.handle(&event("CountdownBegin"), NOW);
+        capture.handle(&event("RoundStarted"), NOW);
+        capture.handle(&hit(2, 1, -5100.0), NOW);
         capture.handle(&packet("MatchEnded", p["end"].clone()), NOW);
         // After the end, a hit counts for nobody.
-        capture.handle(&hit(0, 0), NOW);
+        capture.handle(&event("BallHit"), NOW);
+        capture.handle(&hit(0, 0, 5100.0), NOW);
         for _ in 0..2 {
             received.extend(capture.handle(&packet("UpdateState", state.clone()), NOW));
         }
@@ -1230,7 +1287,7 @@ mod tests {
             .iter()
             .map(|player| (player["Demos"].clone(), player["CrossbarHits"].clone()))
             .collect();
-        assert_eq!(counts, [(0, 0), (1, 2), (2, 0), (3, 0), (4, 0), (5, 1)].map(|(d, c)| (json!(d), json!(c))));
+        assert_eq!(counts, [(0, 0), (1, 2), (2, 0), (3, 0), (4, 0), (5, 2)].map(|(d, c)| (json!(d), json!(c))));
         // The same JSON as the browser: Demos after Saves, then CrossbarHits, and no Shortcut.
         let first = received[0]["state"]["Players"][1].to_string();
         assert!(first.ends_with(r#""Saves":1,"Demos":1,"CrossbarHits":2}"#), "{first}");
