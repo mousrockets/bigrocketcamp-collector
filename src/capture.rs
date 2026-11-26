@@ -136,16 +136,36 @@ struct CurrentMatch {
     /// True during a goal replay: the stat feed events of the goal itself come before it, between `GoalScored` and
     /// `GoalReplayStart`, so `after_goal` would lose them.
     in_goal_replay: bool,
+    /// True from `RoundStarted` to the round's first touch, the kickoff's.
+    kickoff_pending: bool,
+    /// The last touch outside goal replays: a goal's distance is the one of the scorer's last touch.
+    last_hit: Option<LastHit>,
+}
+
+/// Who touched the ball in a `BallHit`, and where the ball was.
+struct LastHit {
+    ids: Vec<String>,
+    location: Value,
 }
 
 /// What the events of a match tell of one player.
 #[derive(Default)]
 struct Counted {
     crossbar_hits: u64,
-    /// The number of stat feed events by `EventName`, first seen first.
+    /// The number of stat feed events he earned by `EventName`, first seen first.
     statfeed: Map<String, Value>,
+    /// The number of stat feed events that involved him by `EventName`: the demolitions he suffered, for one.
+    statfeed_secondary: Map<String, Value>,
+    kickoff_touches: u64,
+    own_goals: u64,
+    /// The assists he gave, by the `PrimaryId` of the scorer.
+    assists_to: Map<String, Value>,
     /// The fastest `GoalSpeed` of his goals, as the game sent it.
     fastest_goal: Option<Value>,
+    /// The longest distance of his goals, in whole Unreal units.
+    longest_goal: Option<Value>,
+    /// The shortest `GoalTime` (time since the kickoff) of his goals, as the game sent it.
+    quickest_goal: Option<Value>,
     /// The fastest `PostHitSpeed` of his touches, as the game sent it.
     hardest_hit: Option<Value>,
 }
@@ -232,6 +252,8 @@ impl MatchCapture {
                 touched_since_frame: true,
                 after_goal: false,
                 in_goal_replay: false,
+                kickoff_pending: false,
+                last_hit: None,
             });
             return previous;
         }
@@ -263,6 +285,8 @@ impl MatchCapture {
                 current.after_goal = false;
                 current.in_goal_replay = false;
                 current.touched_since_frame = true;
+                current.kickoff_pending = event == "RoundStarted";
+                current.last_hit = None;
                 return None;
             }
             "StatfeedEvent" => {
@@ -370,6 +394,7 @@ fn scoreboard(current: &CurrentMatch, state: &Value) -> Option<Value> {
             game.insert(key.into(), value.clone());
         }
     }
+    copy(&mut game, source, "Arena");
     copy(&mut game, source, "StatfeedLabels");
     let mut state = state.clone();
     state["Game"] = Value::Object(game);
@@ -387,7 +412,9 @@ fn scoreboard(current: &CurrentMatch, state: &Value) -> Option<Value> {
     if !departures.is_empty() {
         payload.insert("departures".into(), Value::Array(departures));
     }
-    Some(Value::Object(payload))
+    let mut payload = Value::Object(payload);
+    fit_body(&mut payload);
+    Some(payload)
 }
 
 /// The payload sent to `/api/live` when the player leaves before `MatchEnded`: the last known scoreboard, without any
@@ -399,7 +426,9 @@ fn left_match(current: &CurrentMatch, state: &Value, now: i64) -> Option<Value> 
     payload.insert("startedAt".into(), current.started_at.into());
     payload.insert("leftAt".into(), now.into());
     payload.insert("seenIds".into(), seen_ids(current, state)?);
-    Some(Value::Object(payload))
+    let mut payload = Value::Object(payload);
+    fit_body(&mut payload);
+    Some(payload)
 }
 
 /// The ids of the scoreboard's players, in the order the collector saw them.
@@ -513,28 +542,46 @@ fn remember_shortcuts(current: &mut CurrentMatch, players: &[Value]) {
     }
 }
 
+/// Half the length of a standard field, in Unreal units: each goal line is at this Y, the blue one negative.
+const GOAL_LINE_Y: f64 = 5120.0;
+
 /// The goal a team attacks: blue (0) the orange one, at positive Y; orange (1) the blue one, at negative Y.
 fn hits_opponent_goal(team: &Value, y: &Value) -> bool {
+    goal_side(team, y) == Some(true)
+}
+
+/// `Some(true)` for the goal `team` attacks, `Some(false)` for its own, `None` when either is unreadable.
+fn goal_side(team: &Value, y: &Value) -> Option<bool> {
     match (team.as_i64(), y.as_f64()) {
-        (Some(0), Some(y)) => y > 0.0,
-        (Some(1), Some(y)) => y < 0.0,
-        _ => false,
+        (Some(0), Some(y)) => Some(y > 0.0),
+        (Some(1), Some(y)) => Some(y < 0.0),
+        _ => None,
     }
 }
 
-/// What the events counted for the identified player the game names with `player` (`Shortcut`, `TeamNum`); nobody
-/// known, `None`.
-fn counted_for<'a>(current: &'a mut CurrentMatch, player: &Value) -> Option<&'a mut Counted> {
+/// The `PrimaryId` of the identified player the game names with `player` (`Shortcut`, `TeamNum`) in its events.
+fn player_id(current: &CurrentMatch, player: &Value) -> Option<String> {
+    player.get("Shortcut").filter(|shortcut| shortcut.is_number())?;
     let key = shortcut_key(player.get("Shortcut"), player.get("TeamNum"));
-    let id = current.shortcuts.iter().find(|(known, _)| *known == key)?.1.clone();
-    let index = match current.counted.iter().position(|(known, _)| *known == id) {
+    Some(current.shortcuts.iter().find(|(known, _)| *known == key)?.1.clone())
+}
+
+/// What the events counted for the identified player `id`.
+fn counted_by_id<'a>(current: &'a mut CurrentMatch, id: &str) -> &'a mut Counted {
+    let index = match current.counted.iter().position(|(known, _)| known == id) {
         Some(index) => index,
         None => {
-            current.counted.push((id, Counted::default()));
+            current.counted.push((id.to_owned(), Counted::default()));
             current.counted.len() - 1
         }
     };
-    Some(&mut current.counted[index].1)
+    &mut current.counted[index].1
+}
+
+/// What the events counted for the identified player the game names with `player`; nobody known, `None`.
+fn counted_for<'a>(current: &'a mut CurrentMatch, player: &Value) -> Option<&'a mut Counted> {
+    let id = player_id(current, player)?;
+    Some(counted_by_id(current, &id))
 }
 
 /// A `CrossbarHit` on the opponents' goal counts for the identified player who last touched the ball; nobody known,
@@ -549,38 +596,99 @@ fn count_crossbar(current: &mut CurrentMatch, data: &Value) {
     }
 }
 
-/// The fastest speed the game can plausibly send, in Unreal units per second: anything above is unreadable.
+/// The fastest speed the game can plausibly send, in Unreal units per second, and the longest round, in seconds
+/// (the three hours the API accepts for a match): anything above is unreadable.
 const MAX_SPEED: f64 = 100_000.0;
+const MAX_ROUND: f64 = 10_800.0;
+/// Farther than any two points of a field: anything above is unreadable.
+const MAX_DISTANCE: f64 = 20_000.0;
 
-/// Keeps `speed` in `kept` when it is a readable speed above the one kept.
-fn keep_fastest(kept: &mut Option<Value>, speed: &Value) {
-    let Some(value) = speed.as_f64().filter(|value| *value > 0.0 && *value <= MAX_SPEED) else {
+/// Keeps `value` in `kept` when it is a number in `(0, limit]` that `better` prefers to the one kept.
+fn keep_best(kept: &mut Option<Value>, value: &Value, limit: f64, better: fn(f64, f64) -> bool) {
+    let Some(number) = value.as_f64().filter(|number| *number > 0.0 && *number <= limit) else {
         return;
     };
-    if kept.as_ref().and_then(Value::as_f64).is_none_or(|fastest| value > fastest) {
-        *kept = Some(speed.clone());
+    if kept.as_ref().and_then(Value::as_f64).is_none_or(|best| better(number, best)) {
+        *kept = Some(value.clone());
     }
 }
 
-/// A `BallHit` gives its `PostHitSpeed` to each identified player who touched the ball in that frame.
+fn higher(value: f64, best: f64) -> bool {
+    value > best
+}
+
+fn lower(value: f64, best: f64) -> bool {
+    value < best
+}
+
+/// A `BallHit` gives its `PostHitSpeed` to each identified player who touched the ball in that frame, and the
+/// kickoff to all of them when it is the first touch of the round. The collector keeps where it happened: the
+/// distance of a goal is the one of the scorer's last touch.
 fn count_hit(current: &mut CurrentMatch, data: &Value) {
-    let speed = &data["Ball"]["PostHitSpeed"];
-    for player in data["Players"].as_array().map(Vec::as_slice).unwrap_or_default() {
-        if let Some(counted) = counted_for(current, player) {
-            keep_fastest(&mut counted.hardest_hit, speed);
+    let players = data["Players"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let ids: Vec<String> = players.iter().filter_map(|player| player_id(current, player)).collect();
+    let kickoff = std::mem::take(&mut current.kickoff_pending);
+    for id in &ids {
+        let counted = counted_by_id(current, id);
+        keep_best(&mut counted.hardest_hit, &data["Ball"]["PostHitSpeed"], MAX_SPEED, higher);
+        if kickoff {
+            counted.kickoff_touches += 1;
         }
     }
+    current.last_hit = Some(LastHit { ids, location: data["Ball"]["Location"].clone() });
 }
 
-/// A `GoalScored` in the opponents' goal gives its `GoalSpeed` to the identified scorer: an own goal is nobody's.
+/// The distance on the ground, in whole Unreal units, from `location` to the middle of the goal line `team`
+/// attacks.
+fn distance_to_goal(location: &Value, team: &Value) -> Option<Value> {
+    let goal_y = match team.as_i64()? {
+        0 => GOAL_LINE_Y,
+        1 => -GOAL_LINE_Y,
+        _ => return None,
+    };
+    let (x, y) = (location["X"].as_f64()?, location["Y"].as_f64()?);
+    let distance = x.hypot(goal_y - y).round();
+    (distance.is_finite() && distance <= MAX_DISTANCE).then(|| Value::from(distance as u64))
+}
+
+/// A `GoalScored` in the opponents' goal gives the identified scorer its `GoalSpeed`, its `GoalTime` (the length of
+/// the round) and, when the last touch before it was his, its distance; and the identified teammate who assisted
+/// him, an assist to him. In his own goal, it is an own goal.
 fn count_goal(current: &mut CurrentMatch, data: &Value) {
     let scorer = &data["Scorer"];
-    if !hits_opponent_goal(&scorer["TeamNum"], &data["ImpactLocation"]["Y"]) {
+    let Some(scorer_id) = player_id(current, scorer) else {
         return;
+    };
+    match goal_side(&scorer["TeamNum"], &data["ImpactLocation"]["Y"]) {
+        Some(false) => counted_by_id(current, &scorer_id).own_goals += 1,
+        Some(true) => {
+            let distance = current
+                .last_hit
+                .as_ref()
+                .filter(|hit| hit.ids.contains(&scorer_id))
+                .and_then(|hit| distance_to_goal(&hit.location, &scorer["TeamNum"]));
+            let assister = data
+                .get("Assister")
+                .filter(|assister| assister["TeamNum"] == scorer["TeamNum"])
+                .and_then(|assister| player_id(current, assister))
+                .filter(|id| *id != scorer_id);
+            let counted = counted_by_id(current, &scorer_id);
+            keep_best(&mut counted.fastest_goal, &data["GoalSpeed"], MAX_SPEED, higher);
+            keep_best(&mut counted.quickest_goal, &data["GoalTime"], MAX_ROUND, lower);
+            if let Some(distance) = distance {
+                keep_best(&mut counted.longest_goal, &distance, MAX_DISTANCE, higher);
+            }
+            if let Some(assister) = assister {
+                add_one(&mut counted_by_id(current, &assister).assists_to, &scorer_id);
+            }
+        }
+        None => {}
     }
-    if let Some(counted) = counted_for(current, scorer) {
-        keep_fastest(&mut counted.fastest_goal, &data["GoalSpeed"]);
-    }
+}
+
+fn add_one(counts: &mut Map<String, Value>, key: &str) {
+    let count = counts.get(key).and_then(Value::as_u64).unwrap_or(0);
+    counts.insert(key.to_owned(), (count + 1).into());
 }
 
 /// How many stat feed event names a match counts at most, and how long a name or a label may be: the body sent to
@@ -588,11 +696,13 @@ fn count_goal(current: &mut CurrentMatch, data: &Value) {
 const MAX_STATFEED_NAMES: usize = 30;
 const MAX_STATFEED_NAME: usize = 32;
 const MAX_STATFEED_LABEL: usize = 64;
+/// The arena's asset name, `Stadium_P` for one.
+const MAX_ARENA: usize = 64;
 
-/// The game's asset names of stat events are identifiers; anything else is not counted.
-fn statfeed_name(value: &Value) -> Option<&str> {
+/// The game's asset names (stat events, arenas) are identifiers; anything else is not kept.
+fn asset_name(value: &Value, max: usize) -> Option<&str> {
     value.as_str().filter(|name| {
-        (1..=MAX_STATFEED_NAME).contains(&name.len())
+        (1..=max).contains(&name.len())
             && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_')
     })
 }
@@ -604,21 +714,28 @@ fn statfeed_label(value: &Value) -> Option<String> {
     readable.then(|| label.to_owned())
 }
 
-/// A `StatfeedEvent` counts, under its `EventName`, for the identified player who earned it (`MainTarget`). The game
-/// does not list its event names: any name counts, up to `MAX_STATFEED_NAMES` names a match.
+/// A `StatfeedEvent` counts, under its `EventName`, for the identified player who earned it (`MainTarget`), and for
+/// the one it involved (`SecondaryTarget`, the victim of a demolition). The game does not list its event names: any
+/// name counts, up to `MAX_STATFEED_NAMES` names a match.
 fn count_statfeed(current: &mut CurrentMatch, data: &Value) {
-    let Some(name) = statfeed_name(&data["EventName"]) else {
+    let Some(name) = asset_name(&data["EventName"], MAX_STATFEED_NAME) else {
         return;
     };
     let known = current.statfeed_names.iter().position(|(known, _)| known == name);
     if known.is_none() && current.statfeed_names.len() >= MAX_STATFEED_NAMES {
         return;
     }
-    let Some(counted) = counted_for(current, &data["MainTarget"]) else {
+    let main = player_id(current, &data["MainTarget"]);
+    let secondary = player_id(current, &data["SecondaryTarget"]);
+    if main.is_none() && secondary.is_none() {
         return;
-    };
-    let count = counted.statfeed.get(name).and_then(Value::as_u64).unwrap_or(0);
-    counted.statfeed.insert(name.to_owned(), (count + 1).into());
+    }
+    if let Some(id) = main {
+        add_one(&mut counted_by_id(current, &id).statfeed, name);
+    }
+    if let Some(id) = secondary {
+        add_one(&mut counted_by_id(current, &id).statfeed_secondary, name);
+    }
     let label = statfeed_label(&data["Type"]);
     match known {
         Some(index) if current.statfeed_names[index].1.is_none() => current.statfeed_names[index].1 = label,
@@ -638,23 +755,63 @@ fn statfeed_labels(current: &CurrentMatch) -> Map<String, Value> {
 
 /// A player's fields in the scoreboard: the game's, then what the events counted for him.
 fn scoreboard_player(player: &Value, counted: Option<&Counted>) -> Value {
+    let empty = Counted::default();
+    let counted = counted.unwrap_or(&empty);
     let mut picked = Map::new();
     for key in PLAYER_FIELDS {
         copy(&mut picked, player, key);
     }
-    picked.insert("CrossbarHits".into(), counted.map_or(0, |counted| counted.crossbar_hits).into());
+    picked.insert("CrossbarHits".into(), counted.crossbar_hits.into());
     for key in ACTION_FIELDS {
-        copy(&mut picked, player, key);
+        if bounded(player.get(key)) {
+            copy(&mut picked, player, key);
+        }
     }
-    picked
-        .insert("Statfeed".into(), Value::Object(counted.map(|counted| counted.statfeed.clone()).unwrap_or_default()));
-    if let Some(speed) = counted.and_then(|counted| counted.fastest_goal.clone()) {
-        picked.insert("FastestGoal".into(), speed);
+    picked.insert("Statfeed".into(), Value::Object(counted.statfeed.clone()));
+    if !counted.statfeed_secondary.is_empty() {
+        picked.insert("StatfeedSecondary".into(), Value::Object(counted.statfeed_secondary.clone()));
     }
-    if let Some(speed) = counted.and_then(|counted| counted.hardest_hit.clone()) {
-        picked.insert("HardestHit".into(), speed);
+    picked.insert("KickoffTouches".into(), counted.kickoff_touches.into());
+    picked.insert("OwnGoals".into(), counted.own_goals.into());
+    if !counted.assists_to.is_empty() {
+        picked.insert("AssistsTo".into(), Value::Object(counted.assists_to.clone()));
+    }
+    let bests = [
+        ("FastestGoal", &counted.fastest_goal),
+        ("LongestGoal", &counted.longest_goal),
+        ("QuickestGoal", &counted.quickest_goal),
+        ("HardestHit", &counted.hardest_hit),
+    ];
+    for (key, best) in bests {
+        if let Some(best) = best {
+            picked.insert(key.into(), best.clone());
+        }
     }
     Value::Object(picked)
+}
+
+/// The API refuses a body over 64,000 characters (JavaScript's length), and the collector then drops the match.
+const MAX_BODY: usize = 64_000;
+/// The fields of free size a player gets from the events, which a body too long loses first.
+const FREE_SIZE_FIELDS: [&str; 3] = ["Statfeed", "StatfeedSecondary", "AssistsTo"];
+
+/// Keeps the body under the API's limit: past it, the players lose their fields of free size and the match its
+/// stat feed labels. Only names and ids at their longest get there, never a real match.
+fn fit_body(payload: &mut Value) {
+    if utf16_len(&payload.to_string()) <= MAX_BODY {
+        return;
+    }
+    for list in ["/state/Players", "/departures"] {
+        let players = payload.pointer_mut(list).and_then(Value::as_array_mut).map(Vec::as_mut_slice);
+        for player in players.unwrap_or_default().iter_mut().filter_map(Value::as_object_mut) {
+            for key in FREE_SIZE_FIELDS {
+                player.remove(key);
+            }
+        }
+    }
+    if let Some(game) = payload.pointer_mut("/state/Game").and_then(Value::as_object_mut) {
+        game.remove("StatfeedLabels");
+    }
 }
 
 /// The fields of an update kept in the scoreboard, in the browser's order, without the players who have no
@@ -685,6 +842,9 @@ fn final_state(guid: &str, data: &Value, current: &CurrentMatch) -> Option<Value
         Some(_) => return None,
     }
     copy(&mut game, source, "bReplay");
+    if let Some(arena) = asset_name(&source["Arena"], MAX_ARENA) {
+        game.insert("Arena".into(), Value::String(arena.to_owned()));
+    }
     let labels = statfeed_labels(current);
     if !labels.is_empty() {
         game.insert("StatfeedLabels".into(), Value::Object(labels));
@@ -698,11 +858,10 @@ fn final_state(guid: &str, data: &Value, current: &CurrentMatch) -> Option<Value
 
 /// `CrossbarHits` follows them: `final_state` counts it.
 const PLAYER_FIELDS: [&str; 8] = ["Name", "PrimaryId", "TeamNum", "Score", "Goals", "Assists", "Saves", "Demos"];
-/// Since 0.7.0, after `CrossbarHits` so that the older fields keep their place; `Statfeed`, `FastestGoal` and
-/// `HardestHit` follow them.
+/// Since 0.7.0, after `CrossbarHits` so that the older fields keep their place; what the events counted follows them.
 const ACTION_FIELDS: [&str; 3] = ["Shots", "Touches", "CarTouches"];
 const TEAM_FIELDS: [&str; 3] = ["Name", "TeamNum", "Score"];
-const DEPARTURE_FIELDS: [&str; 15] = [
+const DEPARTURE_FIELDS: [&str; 21] = [
     "PrimaryId",
     "Name",
     "TeamNum",
@@ -716,7 +875,13 @@ const DEPARTURE_FIELDS: [&str; 15] = [
     "Touches",
     "CarTouches",
     "Statfeed",
+    "StatfeedSecondary",
+    "KickoffTouches",
+    "OwnGoals",
+    "AssistsTo",
     "FastestGoal",
+    "LongestGoal",
+    "QuickestGoal",
     "HardestHit",
 ];
 
@@ -1006,6 +1171,8 @@ mod tests {
         for player in state["Players"].as_array_mut().unwrap() {
             player["CrossbarHits"] = json!(0);
             player["Statfeed"] = json!({});
+            player["KickoffTouches"] = json!(0);
+            player["OwnGoals"] = json!(0);
         }
         state
     }
@@ -1095,7 +1262,7 @@ mod tests {
         received.extend(capture.handle(&packet("MatchEnded", p["end"].clone()), NOW));
         received.extend(capture.handle(&packet("UpdateState", noisy.clone()), NOW));
         received.extend(capture.handle(&packet("UpdateState", noisy), NOW));
-        let player = r#"{"Name":"renamed-player","PrimaryId":"Epic|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|0","TeamNum":0,"Score":100,"Goals":0,"Assists":0,"Saves":1,"CrossbarHits":0,"Statfeed":{}}"#;
+        let player = r#"{"Name":"renamed-player","PrimaryId":"Epic|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|0","TeamNum":0,"Score":100,"Goals":0,"Assists":0,"Saves":1,"CrossbarHits":0,"Statfeed":{},"KickoffTouches":0,"OwnGoals":0}"#;
         let teams = r#"[{"Name":"Blue","TeamNum":0,"Score":1},{"Name":"Orange","TeamNum":1,"Score":2}]"#;
         let body = received[0].to_string();
         assert!(body.starts_with(&format!(r#"{{"state":{{"MatchGuid":"same-json","Players":[{player},"#)), "{body}");
@@ -1469,7 +1636,10 @@ mod tests {
         assert_eq!(counts, [(0, 0), (1, 2), (2, 0), (3, 0), (4, 0), (5, 2)].map(|(d, c)| (json!(d), json!(c))));
         // The same JSON as the browser: Demos after Saves, then CrossbarHits, and no Shortcut.
         let first = received[0]["state"]["Players"][1].to_string();
-        assert!(first.ends_with(r#""Saves":1,"Demos":1,"CrossbarHits":2,"Statfeed":{}}"#), "{first}");
+        assert!(
+            first.ends_with(r#""Saves":1,"Demos":1,"CrossbarHits":2,"Statfeed":{},"KickoffTouches":0,"OwnGoals":0}"#),
+            "{first}"
+        );
         assert_eq!(check_live_match(&received[0], NOW), Ok(()));
     }
 
@@ -1490,7 +1660,7 @@ mod tests {
         let mut expected = dated(p.clone());
         expected["state"] = unhit(last);
         expected["seenIds"].as_array_mut().unwrap().remove(2);
-        let departure = r#"{"PrimaryId":"PS4|222222|0","Name":"Friend Two","TeamNum":0,"Score":150,"Goals":0,"Assists":0,"Saves":1,"CrossbarHits":0,"Statfeed":{}}"#;
+        let departure = r#"{"PrimaryId":"PS4|222222|0","Name":"Friend Two","TeamNum":0,"Score":150,"Goals":0,"Assists":0,"Saves":1,"CrossbarHits":0,"Statfeed":{},"KickoffTouches":0,"OwnGoals":0}"#;
         let body = expected.to_string();
         assert_eq!(sent.to_string(), format!(r#"{},"departures":[{departure}]}}"#, &body[..body.len() - 1]));
         assert_eq!(check_live_match(&sent, NOW), Ok(()));
@@ -1530,6 +1700,8 @@ mod tests {
                 let mut departure = pick(player, &DEPARTURE_FIELDS);
                 departure["CrossbarHits"] = json!(0);
                 departure["Statfeed"] = json!({});
+                departure["KickoffTouches"] = json!(0);
+                departure["OwnGoals"] = json!(0);
                 departure
             })
             .collect();
@@ -1720,10 +1892,28 @@ mod tests {
     }
 
     fn statfeed(name: &str, label: &str, shortcut: u64, team: u64) -> Value {
+        packet("StatfeedEvent", json!({ "EventName": name, "Type": label, "MainTarget": target(shortcut, team) }))
+    }
+
+    /// A stat feed event that involved a second player, `(shortcut, team)`: the victim of a demolition.
+    fn statfeed_on(name: &str, label: &str, main: (u64, u64), secondary: (u64, u64)) -> Value {
+        let mut event = statfeed(name, label, main.0, main.1);
+        event["Data"]["SecondaryTarget"] = target(secondary.0, secondary.1);
+        event
+    }
+
+    fn hit(speed: Value, players: Value, x: f64, y: f64) -> Value {
         packet(
-            "StatfeedEvent",
-            json!({ "EventName": name, "Type": label, "MainTarget": target(shortcut, team),
-                    "SecondaryTarget": target(0, 1 - team) }),
+            "BallHit",
+            json!({ "Players": players,
+                    "Ball": { "PreHitSpeed": 0, "PostHitSpeed": speed, "Location": { "X": x, "Y": y, "Z": 93 } } }),
+        )
+    }
+
+    fn goal(speed: f64, scorer: Value, y: f64) -> Value {
+        packet(
+            "GoalScored",
+            json!({ "GoalSpeed": speed, "Scorer": scorer, "ImpactLocation": { "X": 0, "Y": y, "Z": 90 } }),
         )
     }
 
@@ -1737,15 +1927,18 @@ mod tests {
             player["CarTouches"] = json!(20 + index);
             player["Boost"] = json!(45);
         }
+        state["Players"][2]["Touches"] = json!("12");
+        state["Players"][2]["CarTouches"] = json!(-1);
         let sent = ended_after("touches", &[state.clone(), without(&state, 1)], &without(&state, 1));
         // After CrossbarHits, so that the older fields keep their place.
         let first = sent["state"]["Players"][0].to_string();
-        assert!(
-            first.ends_with(r#""CrossbarHits":0,"Shots":0,"Touches":10,"CarTouches":20,"Statfeed":{}}"#),
-            "{first}"
-        );
+        let counted = r#""Statfeed":{},"KickoffTouches":0,"OwnGoals":0}"#;
+        assert!(first.ends_with(&format!(r#""CrossbarHits":0,"Shots":0,"Touches":10,"CarTouches":20,{counted}"#)));
         let departure = sent["departures"][0].to_string();
-        assert!(departure.ends_with(r#""CrossbarHits":0,"Shots":1,"Touches":11,"CarTouches":21,"Statfeed":{}}"#));
+        assert!(departure.ends_with(&format!(r#""CrossbarHits":0,"Shots":1,"Touches":11,"CarTouches":21,{counted}"#)));
+        // An unreadable value stays out.
+        let third = sent["state"]["Players"][1].to_string();
+        assert!(third.ends_with(&format!(r#""CrossbarHits":0,"Shots":2,{counted}"#)), "{third}");
         // A game that sends none of them: the fields stay missing.
         let sent = ended_after("touches", &[playing(&p)], &p["state"]);
         assert_eq!(sent["state"]["Players"][0].get("Touches"), None);
@@ -1757,8 +1950,10 @@ mod tests {
             "statfeed",
             &[
                 statfeed("Demolish", "Démolition", 1, 0),
-                statfeed("Demolish", "Démolition", 1, 0),
+                statfeed_on("Demolish", "Démolition", (1, 0), (2, 1)),
                 statfeed("Save", "Arrêt", 2, 1),
+                // A bot demolishes a player: the victim's count only.
+                statfeed_on("Demolish", "Démolition", (7, 0), (0, 1)),
                 // Nobody the scoreboard names, or a name the game would not use: counted for nobody.
                 statfeed("Clear", "Dégagement", 7, 0),
                 statfeed("Bad Name", "x", 1, 0),
@@ -1769,7 +1964,7 @@ mod tests {
                 statfeed("Goal", "But", 0, 0),
                 event("GoalReplayStart"),
                 statfeed("Goal", "But", 0, 0),
-                statfeed("Demolish", "Démolition", 1, 0),
+                statfeed_on("Demolish", "Démolition", (1, 0), (2, 1)),
                 event("GoalReplayEnd"),
                 event("CountdownBegin"),
                 // An unreadable label: the name counts, and a later readable label fills it in.
@@ -1783,11 +1978,11 @@ mod tests {
                 statfeed("Goal", "But", 0, 0),
                 event("MatchEnded"),
                 statfeed("MVP", "Joueur du match", 1, 0),
-                statfeed("Demolish", "Démolition", 1, 0),
+                statfeed_on("Demolish", "Démolition", (1, 0), (2, 1)),
             ],
         );
-        let feeds: Vec<Value> =
-            sent["state"]["Players"].as_array().unwrap().iter().map(|p| p["Statfeed"].clone()).collect();
+        let players = sent["state"]["Players"].as_array().unwrap();
+        let feeds: Vec<&Value> = players.iter().map(|player| &player["Statfeed"]).collect();
         let expected = [
             json!({ "Goal": 2 }),
             json!({ "Demolish": 2 }),
@@ -1796,19 +1991,26 @@ mod tests {
             json!({}),
             json!({ "Save": 1, "EpicSave": 2 }),
         ];
-        assert_eq!(feeds, expected);
+        assert_eq!(feeds, expected.iter().collect::<Vec<_>>());
+        let suffered: Vec<Option<&Value>> = players.iter().map(|player| player.get("StatfeedSecondary")).collect();
+        let demolished = json!({ "Demolish": 1 });
+        assert_eq!(suffered, [None, None, None, Some(&demolished), None, Some(&demolished)]);
         let labels =
             r#""StatfeedLabels":{"Demolish":"Démolition","Save":"Arrêt","Goal":"But","EpicSave":"Arrêt décisif"}"#;
         let body = sent.to_string();
         assert!(body.contains(&format!(r#""Winner":"Orange",{labels}}}}}"#)), "{body}");
+        let last = players[5].to_string();
+        let feed = r#""Statfeed":{"Save":1,"EpicSave":2},"StatfeedSecondary":{"Demolish":1},"KickoffTouches":0"#;
+        assert!(last.contains(feed), "{last}");
     }
 
     #[test]
-    fn the_left_payload_carries_the_stat_feed_and_its_labels() {
+    fn the_left_payload_carries_the_stat_feed_the_arena_and_the_labels() {
         let p = payload("statfeed-left");
         let guid = json!({ "MatchGuid": "statfeed-left" });
         let mut state = playing(&p);
         state["Players"][1]["Shortcut"] = json!(1);
+        state["Game"]["Arena"] = json!("Stadium_P");
         let mut capture = MatchCapture::default();
         capture.handle(&packet("MatchCreated", guid.clone()), NOW);
         capture.handle(&packet("UpdateState", state.clone()), NOW);
@@ -1818,12 +2020,24 @@ mod tests {
         capture.handle(&packet("UpdateState", state), NOW);
         let sent = capture.handle(&packet("MatchDestroyed", guid), NOW).unwrap();
         assert_eq!(sent["state"]["Players"][1]["Statfeed"], json!({ "Demolish": 1 }));
-        assert!(
-            sent["state"]["Game"]
-                .to_string()
-                .ends_with(r#""bReplay":false,"StatfeedLabels":{"Demolish":"Démolition"}}"#)
-        );
+        let game = sent["state"]["Game"].to_string();
+        assert!(game.ends_with(r#""bReplay":false,"Arena":"Stadium_P","StatfeedLabels":{"Demolish":"Démolition"}}"#));
         assert_eq!(check_live_match(&sent, NOW), Ok(()));
+    }
+
+    #[test]
+    fn sends_the_arena_the_game_names() {
+        let p = payload("arena");
+        let with_arena = |arena: Value| {
+            let mut state = p["state"].clone();
+            state["Game"]["Arena"] = arena;
+            ended_after("arena", &[playing(&p)], &state)
+        };
+        let sent = with_arena(json!("cs_day_p"));
+        assert!(sent["state"]["Game"].to_string().ends_with(r#""Winner":"Orange","Arena":"cs_day_p"}"#));
+        for unreadable in [json!(""), json!("Stadium P"), json!(3), json!("a".repeat(65))] {
+            assert_eq!(with_arena(unreadable.clone())["state"]["Game"].get("Arena"), None, "{unreadable}");
+        }
     }
 
     #[test]
@@ -1840,117 +2054,163 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_fastest_goal_and_the_hardest_hit_outside_goal_replays_and_before_the_end() {
-        let hit = |speed: Value, players: Value| {
-            packet("BallHit", json!({ "Players": players, "Ball": { "PreHitSpeed": 0, "PostHitSpeed": speed } }))
-        };
-        let goal = |speed: f64, scorer: Value, y: f64| {
-            packet(
-                "GoalScored",
-                json!({ "GoalSpeed": speed, "Scorer": scorer, "ImpactLocation": { "X": 0, "Y": y, "Z": 90 } }),
-            )
+    fn counts_goals_touches_and_kickoffs_outside_goal_replays_and_before_the_end() {
+        let timed = |mut goal: Value, time: f64, assister: Option<Value>| {
+            goal["Data"]["GoalTime"] = json!(time);
+            if let Some(assister) = assister {
+                goal["Data"]["Assister"] = assister;
+            }
+            goal
         };
         let sent = ended_with_events(
-            "speeds",
+            "goals",
             &[
-                // Both players touched the ball in that frame.
-                hit(json!(1450.2), json!([target(1, 0), target(0, 1)])),
-                hit(json!(900), json!([target(1, 0)])),
-                hit(json!(2000), json!([target(0, 1)])),
-                hit(json!("fast"), json!([target(2, 0)])),
-                hit(json!(-1), json!([target(2, 0)])),
-                hit(json!(1e9), json!([target(2, 0)])),
-                hit(json!(5000), json!([target(7, 0)])),
-                goal(87.3, target(1, 0), 5120.0),
-                // The goal replay sends the touches and the goal again.
-                hit(json!(3000), json!([target(1, 0)])),
-                goal(150.0, target(1, 0), 5120.0),
                 event("CountdownBegin"),
-                goal(60.0, target(1, 0), 5120.0),
-                // An own goal is nobody's goal.
-                goal(120.0, target(2, 0), -5120.0),
+                event("RoundStarted"),
+                // The kickoff: both players touched the ball in that frame.
+                hit(json!(1450.2), json!([target(1, 0), target(0, 1)]), 0.0, 0.0),
+                hit(json!(900), json!([target(1, 0)]), -500.0, -2000.0),
+                hit(json!(2000), json!([target(0, 1)]), 0.0, 0.0),
+                hit(json!("fast"), json!([target(2, 0)]), 0.0, 0.0),
+                hit(json!(-1), json!([target(2, 0)]), 0.0, 0.0),
+                hit(json!(1e9), json!([target(2, 0)]), 0.0, 0.0),
+                hit(json!(5000), json!([target(7, 0)]), 0.0, 0.0),
+                // His last touch, 3,162 units from the middle of the orange goal line (0, 5120).
+                hit(json!(800), json!([target(1, 0)]), 1000.0, 2120.0),
+                timed(goal(87.3, target(1, 0), 5150.0), 42.5, Some(target(2, 0))),
+                // The goal replay sends the touches and the goal again.
+                hit(json!(3000), json!([target(1, 0)]), 0.0, 4000.0),
+                timed(goal(150.0, target(1, 0), 5150.0), 1.5, Some(target(2, 0))),
+                event("CountdownBegin"),
+                event("RoundStarted"),
+                hit(json!(1100), json!([target(0, 1)]), 0.0, 0.0),
+                hit(json!(1200), json!([target(1, 0)]), 0.0, -1000.0),
+                hit(json!(1300), json!([target(2, 0)]), 0.0, 4000.0),
+                // The scorer did not touch the ball last: a goal without a distance.
+                timed(goal(60.0, target(1, 0), 5150.0), 12.5, Some(target(2, 0))),
+                event("RoundStarted"),
+                // An own goal: blue scores in the blue goal.
+                goal(120.0, target(2, 0), -5150.0),
+                event("RoundStarted"),
+                // An assister of the other team is nobody's assist.
+                timed(goal(70.0, target(0, 1), -5150.0), 0.0, Some(target(1, 0))),
                 event("RoundStarted"),
                 event("MatchEnded"),
-                hit(json!(4000), json!([target(1, 0)])),
-                goal(140.0, target(0, 1), -5120.0),
+                hit(json!(4000), json!([target(1, 0)]), 0.0, 0.0),
+                timed(goal(140.0, target(0, 1), -5150.0), 3.0, None),
             ],
         );
         let players = sent["state"]["Players"].as_array().unwrap();
-        assert_eq!(players[1]["FastestGoal"], json!(87.3));
-        assert_eq!(players[1]["HardestHit"], json!(1450.2));
-        assert_eq!(players[3]["HardestHit"], json!(2000));
-        assert_eq!(players[3].get("FastestGoal"), None);
-        assert_eq!(players[2].get("HardestHit"), None);
-        assert_eq!(players[2].get("FastestGoal"), None);
-        let second = players[1].to_string();
-        assert!(
-            second.ends_with(r#""CrossbarHits":0,"Statfeed":{},"FastestGoal":87.3,"HardestHit":1450.2}"#),
-            "{second}"
+        let counted = |index: usize| {
+            let player = players[index].as_object().unwrap();
+            let from = player.keys().position(|key| key == "KickoffTouches").unwrap();
+            Value::Object(player.iter().skip(from).map(|(key, value)| (key.clone(), value.clone())).collect())
+        };
+        assert_eq!(counted(0), json!({ "KickoffTouches": 0, "OwnGoals": 0 }));
+        assert_eq!(
+            players[1].to_string().split(r#""Statfeed":{},"#).nth(1).unwrap(),
+            r#""KickoffTouches":1,"OwnGoals":0,"FastestGoal":87.3,"LongestGoal":3162,"QuickestGoal":12.5,"HardestHit":1450.2}"#
         );
+        let scorer = players[1]["PrimaryId"].as_str().unwrap();
+        assert_eq!(
+            counted(2),
+            json!({ "KickoffTouches": 0, "OwnGoals": 1, "AssistsTo": { scorer: 2 }, "HardestHit": 1300 })
+        );
+        assert_eq!(counted(3), json!({ "KickoffTouches": 2, "OwnGoals": 0, "FastestGoal": 70.0, "HardestHit": 2000 }));
     }
 
-    /// The API refuses a body over 64,000 characters (JavaScript's length), and the collector then drops the match.
-    #[test]
-    fn the_body_stays_under_the_api_limit_in_the_worst_case() {
-        // A 4v4 seen with sixteen players, half of whom left: names and ids at their longest, each character escaped.
-        let player = |index: usize| {
-            let filler = "\u{1}".repeat(127);
-            json!({ "Name": format!("{filler}{}", (b'a' + index as u8) as char),
-                    "PrimaryId": format!("Steam|{filler}{}|0", (b'a' + index as u8) as char),
-                    "Shortcut": index, "TeamNum": index % 2, "Score": 999_999, "Goals": 999_999, "Shots": 999_999,
-                    "Assists": 999_999, "Saves": 999_999, "Touches": 999_999, "CarTouches": 999_999, "Demos": 999_999 })
-        };
-        let mut state = payload("worst")["state"].clone();
+    /// A 4v4 seen with sixteen players, half of whom left, every one with as much counted as the capture keeps:
+    /// thirty stat feed names earned and suffered, three-digit counts, an assist, a goal and a hit.
+    fn heaviest_match(player: impl Fn(usize) -> Value) -> Value {
+        let mut state = payload("heavy")["state"].clone();
         state["Game"]["PlaylistId"] = json!(4);
         state["Game"]["TimeSeconds"] = json!(300);
         state["Game"]["bOvertime"] = json!(false);
+        state["Game"]["Arena"] = json!("a".repeat(MAX_ARENA));
         let mut capture = MatchCapture::default();
         let mut received = Vec::new();
-        capture.handle(&packet("MatchCreated", json!({ "MatchGuid": "worst" })), NOW);
+        let mut send = |capture: &mut MatchCapture, mut message: Value| {
+            message["Data"]["MatchGuid"] = json!("heavy");
+            received.extend(capture.handle(&message, NOW));
+        };
+        send(&mut capture, event("MatchCreated"));
+        let label = "\"".repeat(MAX_STATFEED_LABEL);
         for half in [0..8, 8..16] {
-            state["Players"] = half.clone().map(player).collect();
-            capture.handle(&packet("UpdateState", state.clone()), NOW);
+            state["Players"] = half.clone().map(&player).collect();
+            send(&mut capture, packet("UpdateState", state.clone()));
             for index in half {
-                let (shortcut, team) = (index as u64, index as u64 % 2);
-                let y = if team == 0 { 5120.0 } else { -5120.0 };
-                for (name, data) in [
-                    (
-                        "BallHit",
-                        json!({ "Players": [target(shortcut, team)], "Ball": { "PostHitSpeed": 1_234.567_890_123_4 } }),
-                    ),
-                    (
-                        "GoalScored",
-                        json!({ "GoalSpeed": 123.456_789_012_34, "Scorer": target(shortcut, team), "ImpactLocation": { "Y": y } }),
-                    ),
-                    ("CountdownBegin", json!({})),
-                ] {
-                    let mut message = packet(name, data);
-                    message["Data"]["MatchGuid"] = json!("worst");
-                    capture.handle(&message, NOW);
-                }
+                let (me, teammate, opponent) = (index as u64, (index ^ 2) as u64, (index ^ 1) as u64);
+                let team = me % 2;
+                let y = if team == 0 { 5150.0 } else { -5150.0 };
+                send(&mut capture, event("RoundStarted"));
+                send(&mut capture, hit(json!(1_234.567_890_123_4), json!([target(me, team)]), -4096.0, -y));
+                let mut scored = goal(123.456_789_012_34, target(me, team), y);
+                scored["Data"]["GoalTime"] = json!(123.456_789_012_34);
+                scored["Data"]["Assister"] = target(teammate, team);
+                send(&mut capture, scored);
                 for name in 0..MAX_STATFEED_NAMES {
                     let name = format!("{name:0>32}");
                     for _ in 0..100 {
-                        let mut feed =
-                            statfeed(&name, &"\"".repeat(MAX_STATFEED_LABEL), index as u64, index as u64 % 2);
-                        feed["Data"]["MatchGuid"] = json!("worst");
-                        capture.handle(&feed, NOW);
+                        send(&mut capture, statfeed_on(&name, &label, (me, team), (opponent, 1 - team)));
                     }
                 }
             }
-            capture.handle(&packet("UpdateState", state.clone()), NOW);
+            send(&mut capture, packet("UpdateState", state.clone()));
         }
-        capture.handle(&packet("MatchEnded", json!({ "MatchGuid": "worst", "WinnerTeamNum": 1 })), NOW);
+        send(&mut capture, packet("MatchEnded", json!({ "WinnerTeamNum": 1 })));
         for _ in 0..2 {
-            received.extend(capture.handle(&packet("UpdateState", state.clone()), NOW));
+            send(&mut capture, packet("UpdateState", state.clone()));
         }
         assert_eq!(received.len(), 1);
-        let sent = &received[0];
-        assert_eq!(check_live_match(sent, NOW), Ok(()));
+        let sent = received.remove(0);
+        assert_eq!(check_live_match(&sent, NOW), Ok(()));
         assert_eq!(sent["departures"].as_array().unwrap().len(), 8);
-        assert_eq!(sent["state"]["Players"][0]["Statfeed"].as_object().unwrap().len(), MAX_STATFEED_NAMES);
-        let length = utf16_len(&sent.to_string());
-        assert!(length < 64_000, "{length}");
+        assert!(utf16_len(&sent.to_string()) <= MAX_BODY);
+        sent
+    }
+
+    fn statistics(index: usize) -> Value {
+        json!({ "Shortcut": index, "TeamNum": index % 2, "Score": 999_999, "Goals": 999_999, "Shots": 999_999,
+                "Assists": 999_999, "Saves": 999_999, "Touches": 999_999, "CarTouches": 999_999, "Demos": 999_999 })
+    }
+
+    #[test]
+    fn a_real_match_keeps_everything_under_the_api_limit() {
+        let sent = heaviest_match(|index| {
+            let mut player = statistics(index);
+            player["Name"] = json!(format!("Player name {index:0>4}"));
+            player["PrimaryId"] = json!(format!("Epic|{index:0>32}|0"));
+            player
+        });
+        for player in sent["state"]["Players"].as_array().unwrap().iter().chain(sent["departures"].as_array().unwrap())
+        {
+            assert_eq!(player["Statfeed"].as_object().unwrap().len(), MAX_STATFEED_NAMES);
+            assert_eq!(player["StatfeedSecondary"].as_object().unwrap().len(), MAX_STATFEED_NAMES);
+            assert_eq!(player["AssistsTo"].as_object().unwrap().len(), 1);
+            assert_eq!(player["LongestGoal"], 11057);
+        }
+        assert_eq!(sent["state"]["Game"]["StatfeedLabels"].as_object().unwrap().len(), MAX_STATFEED_NAMES);
+    }
+
+    #[test]
+    fn names_and_ids_at_their_longest_lose_the_fields_of_free_size_but_never_the_match() {
+        // Each character of the names and ids is escaped: six characters in the body.
+        let sent = heaviest_match(|index| {
+            let filler = "\u{1}".repeat(127);
+            let mut player = statistics(index);
+            player["Name"] = json!(format!("{filler}{}", (b'a' + index as u8) as char));
+            player["PrimaryId"] = json!(format!("Steam|{filler}{}|0", (b'a' + index as u8) as char));
+            player
+        });
+        for player in sent["state"]["Players"].as_array().unwrap().iter().chain(sent["departures"].as_array().unwrap())
+        {
+            for key in FREE_SIZE_FIELDS {
+                assert_eq!(player.get(key), None, "{key}");
+            }
+            assert_eq!(player["KickoffTouches"], 1);
+            assert_eq!(player["HardestHit"], json!(1_234.567_890_123_4));
+        }
+        assert_eq!(sent["state"]["Game"].get("StatfeedLabels"), None);
     }
 
     #[test]
