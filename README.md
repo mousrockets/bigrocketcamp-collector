@@ -92,12 +92,42 @@ Content-Type: application/json
 - `Game.TimeSeconds` et `Game.bOvertime` sont l'horloge de la dernière mise à jour avant `MatchEnded` : du temps restant hors prolongation, c'est un forfait des perdants. Une mise à jour après la fin ne fait baisser le temps restant que s'il était d'une seconde au plus (le passage à 0:00 arrivé en retard) : le jeu peut remettre l'horloge à 0:00 après un forfait. Absents si le jeu ne les envoie pas.
 - `clockTrace` (depuis 0.4.0) : les six derniers changements de l'horloge avant `MatchEnded` et les six premiers après, chacun avec `TimeSeconds`, `bOvertime` et `ended`. L'API les garde tels quels pour vérifier comment le jeu termine un forfait. Absent si le jeu n'envoie pas d'horloge.
 - Démos et poteaux (depuis 0.6.0) : chaque joueur de `state.Players` porte `Demos` (ses démolitions, telles que le jeu les donne, absent s'il ne les donne pas), puis `CrossbarHits` : le nombre d'événements `CrossbarHit` (ballon sur la barre ou un poteau) reçus avant `MatchEnded` dont il était le dernier à toucher le ballon, retrouvé par `BallLastTouch.Player.Shortcut` et son équipe. Depuis 0.6.1, seul compte le cadre du but adverse (`BallLocation.Y` positif pour l'équipe 0, négatif pour l'équipe 1), une seule fois par toucher de balle (`BallHit`), et rien entre `GoalScored` et le coup d'envoi suivant (`CountdownBegin`, `RoundStarted`), car le ralenti du but renvoie les mêmes contacts. Les départs portent les mêmes deux champs.
-- `departures` (depuis 0.5.0) : les joueurs identifiés vus avant `MatchEnded` et absents de la dernière mise à jour reçue avant `MatchEnded`, dans l'ordre où le collecteur les a vus, huit au plus. Chacun garde ses dernières valeurs : `PrimaryId`, `Name`, `TeamNum`, `Score`, `Goals`, `Assists`, `Saves`, `Demos`, `CrossbarHits`. L'API compte une défaite au joueur du club parti avant la fin, et un forfait gagné quand tous les adversaires sont partis. Un joueur revenu avant la fin n'y est pas, ni un joueur parti pendant le podium. Absent si personne n'est parti.
+- Toutes les stats du jeu (depuis 0.7.0) : chaque joueur de `state.Players` et chaque départ portent, après `CrossbarHits` et dans cet ordre, les champs décrits plus bas. Les champs plus anciens gardent leur place.
+- `departures` (depuis 0.5.0) : les joueurs identifiés vus avant `MatchEnded` et absents de la dernière mise à jour reçue avant `MatchEnded`, dans l'ordre où le collecteur les a vus, huit au plus. Chacun garde ses dernières valeurs : `PrimaryId`, `Name`, `TeamNum`, `Score`, `Goals`, `Assists`, `Saves`, `Demos`, `CrossbarHits`, puis depuis 0.7.0 `Shots`, `Touches`, `CarTouches`, `Statfeed`, `FastestGoal`, `HardestHit`. L'API compte une défaite au joueur du club parti avant la fin, et un forfait gagné quand tous les adversaires sont partis. Un joueur revenu avant la fin n'y est pas, ni un joueur parti pendant le podium. Absent si personne n'est parti.
 - Départ avant la fin (depuis 0.5.0) : quand le joueur quitte un match suivi depuis sa création avant tout `MatchEnded` (`MatchDestroyed` de ce match, ou un autre match qui commence), le collecteur envoie `{"left":true,"state":{…},"startedAt":…,"leftAt":…,"seenIds":[…]}`. `state` est le dernier tableau connu du match, hors replay et avec au moins un joueur identifié, avec les mêmes champs de joueurs et d'équipes que le tableau de fin, mais sans gagnant : `Game` ne contient que `PlaylistId`, `Teams` et `bReplay`. Ni `end` ni `endedAt` ; `leftAt` est l'heure du départ, en millisecondes. Rien n'est envoyé pour un replay, une playlist privée ou inconnue, ni un match rejoint en cours, ni quand le jeu se ferme ou que la connexion au Stats API se coupe : rien ne dit alors que le joueur est parti, et un départ compté à tort serait une fausse défaite. L'API n'en retient que le départ du membre du jeton, compté comme une défaite. La réponse attendue est la même que pour un match, et un tableau de fin du même match encore dans la file n'est jamais remplacé par un départ.
 - Le collecteur envoie le tableau dès qu'il reçoit deux fois de suite le même après `MatchEnded`. Sinon, il envoie le dernier tableau connu du match quand le joueur le quitte, quand un autre match commence ou quand le jeu se ferme.
 - Sans cookie ni en-tête `Origin` : avec un jeton `Bearer`, la route ne doit pas exiger la même origine. Elle vérifie toujours que le tableau contient un identifiant de jeu du membre du jeton.
 - `200` : `{"ok":true,"match":"<MatchGuid sans espaces, en minuscules>"}`. Sans cette confirmation exacte, le match reste dans la file.
 - `400`, `403` (aucun joueur du membre dans le tableau) ou `413` : refus définitif, le match est retiré de la file.
+
+#### Les stats de chaque joueur (depuis 0.7.0)
+
+Un joueur du tableau de fin, avec toutes ses stats :
+
+```json
+{"Name":"joueur-un","PrimaryId":"Epic|0123456789abcdef0123456789abcdef|0","TeamNum":0,
+ "Score":420,"Goals":2,"Assists":1,"Saves":3,"Demos":1,"CrossbarHits":1,
+ "Shots":5,"Touches":38,"CarTouches":4,
+ "Statfeed":{"Save":3,"Demolish":1},
+ "FastestGoal":87.3,"HardestHit":1450.2}
+```
+
+L'exemple ne cite que `Save` et `Demolish`, les deux noms que donne la doc du jeu ; les intitulés plus bas sont illustratifs.
+
+- `Shots`, `Touches` (touchers de balle), `CarTouches` (touchers par le châssis de la voiture, selon la doc) : les valeurs de la dernière mise à jour du joueur, telles que le jeu les donne. Absents si le jeu ne les donne pas.
+- `Statfeed` : toujours présent, `{}` si rien n'est compté. Pour chaque `EventName` de `StatfeedEvent`, le nombre d'événements dont le joueur est la cible principale (`MainTarget`, retrouvé par `Shortcut` et équipe, comme pour les poteaux). Le collecteur ne connaît aucun nom à l'avance et compte ce que le jeu envoie. Il ignore un événement reçu après `MatchEnded`, pendant le ralenti d'un but (de `GoalReplayStart` à `GoalReplayEnd`, ou jusqu'au coup d'envoi suivant si le ralenti est passé), ou dont la cible n'est pas un joueur identifié du tableau. Les événements du but lui-même, envoyés entre `GoalScored` et `GoalReplayStart`, comptent. Seuls comptent les noms de 1 à 32 caractères parmi `A-Z`, `a-z`, `0-9` et `_`, et 30 noms différents au plus par match : un nom nouveau au-delà est ignoré, les noms déjà vus continuent de compter. Les noms sont dans l'ordre du premier événement reçu pour ce joueur.
+- `FastestGoal` : la plus grande `GoalSpeed` des `GoalScored` dont le joueur est le `Scorer`, dans le but adverse (`ImpactLocation.Y`, comme pour les poteaux : un but contre son camp ne compte pour personne). `HardestHit` : la plus grande `Ball.PostHitSpeed` des `BallHit` où il figure dans `Players` (un contact à deux compte pour les deux). Pour les deux : la valeur telle que le jeu l'envoie, nombre décimal en unités Unreal par seconde selon la doc (1 uu/s = 0,036 km/h), rien entre `GoalScored` et le coup d'envoi suivant ni après `MatchEnded`, et seulement une valeur strictement positive d'au plus 100 000. Absents si le joueur n'a ni but ni toucher compté. Attention : l'exemple de `GoalScored` dans la doc donne `"GoalSpeed": 87.3`, qui ressemble plus à des km/h qu'à des uu/s ; à vérifier sur un vrai match avant de convertir.
+
+Au niveau du match, `state.Game.StatfeedLabels` donne l'intitulé déjà traduit par le jeu (`Type`) de chaque nom compté, pour afficher un événement nouveau sans liste en dur :
+
+```json
+"Game":{"PlaylistId":11,"Teams":[…],"bHasWinner":true,"bReplay":false,"Winner":"Blue","TimeSeconds":0,"bOvertime":false,
+        "StatfeedLabels":{"Save":"Arrêt","Demolish":"Démolition"}}
+```
+
+- Le dernier champ de `Game`, dans le tableau de fin comme dans un départ avant la fin (`left`). Absent si aucun événement n'est compté.
+- L'intitulé est retiré de ses espaces au début et à la fin, et gardé s'il fait de 1 à 64 caractères sans caractère de contrôle. Sinon le nom n'a pas d'intitulé, jusqu'à un événement suivant du même nom qui en porte un lisible : l'app affiche alors `EventName`.
+- Ces plafonds gardent le corps sous les 64 000 caractères de l'API, même avec seize joueurs aux noms et identifiants les plus longs (test `the_body_stays_under_the_api_limit_in_the_worst_case`).
 - `401` : jeton révoqué. Le collecteur l'efface et redemande un code.
 - Autre réponse, ou site injoignable : nouvel essai 10 secondes plus tard. `error` est affiché s'il est présent.
 
