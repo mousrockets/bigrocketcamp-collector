@@ -137,6 +137,29 @@ Les champs :
 - Pour ces quatre champs : la valeur telle que le jeu l'envoie (la distance est calculée par le collecteur), seulement si elle est strictement positive et d'au plus 100 000 pour une vitesse, 10 800 pour une durée, 20 000 pour une distance. Absents sinon. Les vitesses sont en unités Unreal par seconde selon la doc (1 uu/s = 0,036 km/h). Attention : l'exemple de `GoalScored` dans la doc donne `"GoalSpeed": 87.3`, qui ressemble plus à des km/h. À vérifier sur un vrai match avant de convertir.
 - `LongestGoal` suppose un terrain standard. Sur Hoops (playlist 27) ou Dropshot, il n'a pas de sens : à filtrer par `PlaylistId`.
 
+#### Le boost, le mouvement, la possession et les zones de touche (depuis 0.8.0)
+
+Après les champs précédents, un joueur gagne, quand le match a eu au moins une mise à jour de jeu :
+
+```json
+"AerialTouches":12,"DefensiveTouches":16,"OffensiveTouches":24,
+"Possession":{"Samples":3651,"Owned":1781},
+"Car":{"Samples":3716,"BoostSum":175458,"NoBoost":353,"FullBoost":296,"Supersonic":530,"OnGround":2587,"OnWall":315,
+       "Boosting":844,"Powerslides":92,"Pickups":118,"BigPickups":25,"BoostCollected":2970}
+```
+
+Une mise à jour de jeu est un `UpdateState` hors ralenti (`bReplay` faux), entre `RoundStarted` et le but suivant, et avant `MatchEnded`. Le jeu en envoie environ dix par seconde (`PacketSendRate`). Les comptes de mises à jour se lisent comme une part du temps, quel que soit ce rythme.
+
+- `AerialTouches`, `DefensiveTouches`, `OffensiveTouches` : parmi ses touchers comptés comme pour `HardestHit`, ceux où la balle est à plus de 300 unités de haut (`BallHit.Ball.Location.Z`), dans le tiers du terrain de son propre but, ou dans celui du but adverse (Y au-delà de ±5 120 / 3).
+- `Possession` : `Samples`, le nombre de mises à jour de jeu où une équipe a touché la balle en dernier (`Game.Ball.TeamNum` 0 ou 1) ; `Owned`, celles où c'était la sienne. Les deux coéquipiers ont la même.
+- `Car` : seulement pour une voiture que le jeu montre. Pendant le jeu, il ne montre que celles de l'équipe du joueur qui a lancé le collecteur ; les autres arrivent sans `bHasCar`. Absent si aucune mise à jour ne l'a montrée.
+  - `Samples` : les mises à jour de jeu où la voiture est sur le terrain (`bHasCar` vrai, `bDemolished` faux).
+  - `BoostSum` : la somme de leur `Boost`, de 0 à 100, arrondi. Un réservoir vide arrive sans `Boost`. `BoostSum / Samples` donne le boost moyen.
+  - `NoBoost`, `FullBoost` : celles à 0 et à 100 de boost. `Supersonic`, `OnGround`, `OnWall`, `Boosting` : celles où le drapeau du même nom (`bSupersonic`…) est vrai. En l'air : `Samples − OnGround − OnWall`.
+  - `Powerslides` : les dérapages commencés (`bPowersliding` qui passe à vrai).
+  - `Pickups` : le jeu n'envoie aucun ramassage de boost. Chaque hausse du `Boost` d'une mise à jour à la suivante en compte un. Deux pastilles dans la même mise à jour n'en font qu'une : c'est une estimation. Sur un vrai match du 27 novembre 2026, 118 et 106 pour 119 et 104 au tableau du jeu. Après le coup d'envoi (33 de boost pour chacun) ou une démolition, la hausse suivante ne compte pas.
+  - `BigPickups` : les hausses de plus de 12, le don d'une petite pastille. `BoostCollected` : la somme des hausses.
+
 Au niveau du match, `state.Game` porte deux champs de plus, en dernier, dans le tableau de fin comme dans un départ avant la fin (`left`) :
 
 ```json

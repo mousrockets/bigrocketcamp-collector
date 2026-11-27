@@ -140,6 +140,10 @@ struct CurrentMatch {
     kickoff_pending: bool,
     /// The last touch outside goal replays: a goal's distance is the one of the scorer's last touch.
     last_hit: Option<LastHit>,
+    /// True from `RoundStarted` to the round's goal or the next countdown: the cars only move then.
+    in_round: bool,
+    /// The updates of play in which each team, blue then orange, touched the ball last: its possession.
+    ball: [u64; 2],
 }
 
 /// Who touched the ball in a `BallHit`, and where the ball was.
@@ -168,6 +172,98 @@ struct Counted {
     quickest_goal: Option<Value>,
     /// The fastest `PostHitSpeed` of his touches, as the game sent it.
     hardest_hit: Option<Value>,
+    /// His touches with the ball high, near his own goal, near the opponents'.
+    aerial_touches: u64,
+    defensive_touches: u64,
+    offensive_touches: u64,
+    /// What the updates of play tell of his car, when the game shows it: his own team's only.
+    car: Car,
+}
+
+/// A car as the updates of play show it, about ten times a second (`PacketSendRate`). Each count of updates reads as
+/// a share of the time the car was on the pitch, whatever the rate.
+#[derive(Default)]
+struct Car {
+    /// The updates of play with the car on the pitch: neither demolished nor waiting to respawn.
+    samples: u64,
+    /// The boost of each of them added up, from 0 to 100: its average.
+    boost_sum: u64,
+    no_boost: u64,
+    full_boost: u64,
+    supersonic: u64,
+    on_ground: u64,
+    on_wall: u64,
+    boosting: u64,
+    /// The powerslides started.
+    powerslides: u64,
+    /// The rises of the boost between two updates: the game sends no pickup, each rise is one. Two pads within an
+    /// update count as one, so this misses a few: 118 for 119 pads in a real match of 27 November 2026.
+    pickups: u64,
+    /// The rises of a big pad: to a full tank, or by more than a small pad's 12.
+    big_pickups: u64,
+    /// The boost those rises added up.
+    boost_collected: u64,
+    /// The boost of the last update counted; none after a kickoff, a demolition or a car out of sight, whose boost
+    /// jumps without a pickup.
+    last_boost: Option<u64>,
+    powersliding: bool,
+}
+
+/// A small pad gives 12 boost: a rise beyond it, or to a full tank by more than it, is a big pad's.
+const SMALL_PAD: u64 = 12;
+/// Above this height, in Unreal units, the ball is out of reach of a car on the ground: a touch there is aerial.
+const AERIAL_HEIGHT: f64 = 300.0;
+
+impl Car {
+    fn forget(&mut self) {
+        self.last_boost = None;
+        self.powersliding = false;
+    }
+
+    fn sample(&mut self, player: &Value) {
+        let flag = |key: &str| player.get(key).and_then(Value::as_bool).unwrap_or(false);
+        if flag("bDemolished") {
+            self.forget();
+            return;
+        }
+        // An empty tank comes without its `Boost`.
+        let boost = player.get("Boost").and_then(Value::as_f64).filter(|boost| boost.is_finite()).unwrap_or(0.0);
+        let boost = boost.round().clamp(0.0, 100.0) as u64;
+        self.samples += 1;
+        self.boost_sum += boost;
+        self.no_boost += u64::from(boost == 0);
+        self.full_boost += u64::from(boost == 100);
+        self.supersonic += u64::from(flag("bSupersonic"));
+        self.on_ground += u64::from(flag("bOnGround"));
+        self.on_wall += u64::from(flag("bOnWall"));
+        self.boosting += u64::from(flag("bBoosting"));
+        let powersliding = flag("bPowersliding");
+        self.powerslides += u64::from(powersliding && !self.powersliding);
+        self.powersliding = powersliding;
+        if let Some(gained) = self.last_boost.filter(|last| boost > *last).map(|last| boost - last) {
+            self.pickups += 1;
+            self.boost_collected += gained;
+            self.big_pickups += u64::from(gained > SMALL_PAD);
+        }
+        self.last_boost = Some(boost);
+    }
+
+    fn line(&self) -> Value {
+        serde_json::json!({
+            "Samples": self.samples,
+            "BoostSum": self.boost_sum,
+            "NoBoost": self.no_boost,
+            "FullBoost": self.full_boost,
+            "Supersonic": self.supersonic,
+            "OnGround": self.on_ground,
+            "OnWall": self.on_wall,
+            "Boosting": self.boosting,
+            "Powerslides": self.powerslides,
+            "Pickups": self.pickups,
+            "BigPickups": self.big_pickups,
+            "BoostCollected": self.boost_collected,
+        })
+    }
 }
 
 impl CurrentMatch {
@@ -254,6 +350,8 @@ impl MatchCapture {
                 in_goal_replay: false,
                 kickoff_pending: false,
                 last_hit: None,
+                in_round: false,
+                ball: [0, 0],
             });
             return previous;
         }
@@ -271,6 +369,7 @@ impl MatchCapture {
                     count_goal(current, data);
                 }
                 current.after_goal = true;
+                current.in_round = false;
                 return None;
             }
             "GoalReplayStart" => {
@@ -287,6 +386,11 @@ impl MatchCapture {
                 current.touched_since_frame = true;
                 current.kickoff_pending = event == "RoundStarted";
                 current.last_hit = None;
+                // Each car starts the round with 33 boost: no pickup.
+                current.in_round = event == "RoundStarted";
+                for (_, counted) in &mut current.counted {
+                    counted.car.forget();
+                }
                 return None;
             }
             "StatfeedEvent" => {
@@ -326,6 +430,9 @@ impl MatchCapture {
             return None;
         }
         remember_shortcuts(current, players);
+        if current.in_round && current.end.is_none() && data["Game"]["bReplay"] == false {
+            track(current, players, &data["Game"]);
+        }
         let state = final_state(guid, data, current);
         // An empty update, a replay or an unreadable one never replaces the last known scoreboard.
         let usable = state.as_ref().filter(|state| {
@@ -626,16 +733,69 @@ fn lower(value: f64, best: f64) -> bool {
 /// distance of a goal is the one of the scorer's last touch.
 fn count_hit(current: &mut CurrentMatch, data: &Value) {
     let players = data["Players"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let ids: Vec<String> = players.iter().filter_map(|player| player_id(current, player)).collect();
+    let touched: Vec<(String, &Value)> =
+        players.iter().filter_map(|player| Some((player_id(current, player)?, &player["TeamNum"]))).collect();
+    let ids: Vec<String> = touched.iter().map(|(id, _)| id.clone()).collect();
     let kickoff = std::mem::take(&mut current.kickoff_pending);
-    for id in &ids {
+    let location = &data["Ball"]["Location"];
+    let aerial = location["Z"].as_f64().is_some_and(|z| z > AERIAL_HEIGHT);
+    for (id, team) in &touched {
+        let zone = zone(team, &location["Y"]);
         let counted = counted_by_id(current, id);
         keep_best(&mut counted.hardest_hit, &data["Ball"]["PostHitSpeed"], MAX_SPEED, higher);
         if kickoff {
             counted.kickoff_touches += 1;
         }
+        counted.aerial_touches += u64::from(aerial);
+        counted.defensive_touches += u64::from(zone == Some(Zone::Defence));
+        counted.offensive_touches += u64::from(zone == Some(Zone::Attack));
     }
     current.last_hit = Some(LastHit { ids, location: data["Ball"]["Location"].clone() });
+}
+
+/// The third of the pitch a ball is in, for the team of the player who touched it.
+#[derive(PartialEq)]
+enum Zone {
+    Defence,
+    Middle,
+    Attack,
+}
+
+/// Each third of a standard pitch, from its middle to a goal line, is a third of its length.
+fn zone(team: &Value, y: &Value) -> Option<Zone> {
+    let (team, y) = (team.as_i64()?, y.as_f64()?);
+    let toward_attack = match team {
+        0 => y,
+        1 => -y,
+        _ => return None,
+    };
+    Some(if toward_attack < -GOAL_LINE_Y / 3.0 {
+        Zone::Defence
+    } else if toward_attack > GOAL_LINE_Y / 3.0 {
+        Zone::Attack
+    } else {
+        Zone::Middle
+    })
+}
+
+/// One update of play: the team that touched the ball last, and each car the game shows (the sender's team's: the
+/// others come without `bHasCar`).
+fn track(current: &mut CurrentMatch, players: &[Value], game: &Value) {
+    if let Some(team) = game["Ball"]["TeamNum"].as_u64().filter(|team| *team < 2) {
+        current.ball[team as usize] += 1;
+    }
+    for player in players.iter().filter(|player| is_player_id(&player["PrimaryId"])) {
+        let Some(has_car) = player.get("bHasCar").and_then(Value::as_bool) else {
+            continue;
+        };
+        let id = player["PrimaryId"].as_str().unwrap_or_default().to_owned();
+        let car = &mut counted_by_id(current, &id).car;
+        if has_car {
+            car.sample(player);
+        } else {
+            car.forget();
+        }
+    }
 }
 
 /// The distance on the ground, in whole Unreal units, from `location` to the middle of the goal line `team`
@@ -754,7 +914,7 @@ fn statfeed_labels(current: &CurrentMatch) -> Map<String, Value> {
 }
 
 /// A player's fields in the scoreboard: the game's, then what the events counted for him.
-fn scoreboard_player(player: &Value, counted: Option<&Counted>) -> Value {
+fn scoreboard_player(player: &Value, counted: Option<&Counted>, ball: [u64; 2]) -> Value {
     let empty = Counted::default();
     let counted = counted.unwrap_or(&empty);
     let mut picked = Map::new();
@@ -786,6 +946,20 @@ fn scoreboard_player(player: &Value, counted: Option<&Counted>) -> Value {
         if let Some(best) = best {
             picked.insert(key.into(), best.clone());
         }
+    }
+    // Without an update of play (a capture begun mid-round), neither the touches' places nor the possession mean
+    // anything.
+    if ball[0] + ball[1] > 0 {
+        picked.insert("AerialTouches".into(), counted.aerial_touches.into());
+        picked.insert("DefensiveTouches".into(), counted.defensive_touches.into());
+        picked.insert("OffensiveTouches".into(), counted.offensive_touches.into());
+        if let Some(team) = player["TeamNum"].as_u64().filter(|team| *team < 2) {
+            let possession = serde_json::json!({ "Samples": ball[0] + ball[1], "Owned": ball[team as usize] });
+            picked.insert("Possession".into(), possession);
+        }
+    }
+    if counted.car.samples > 0 {
+        picked.insert("Car".into(), counted.car.line());
     }
     Value::Object(picked)
 }
@@ -824,7 +998,7 @@ fn final_state(guid: &str, data: &Value, current: &CurrentMatch) -> Option<Value
         .map(|player| {
             let id = player["PrimaryId"].as_str().unwrap_or_default();
             let counted = current.counted.iter().find(|(known, _)| known == id).map(|(_, counted)| counted);
-            scoreboard_player(player, counted)
+            scoreboard_player(player, counted, current.ball)
         })
         .collect();
     let mut game = Map::new();
@@ -861,7 +1035,7 @@ const PLAYER_FIELDS: [&str; 8] = ["Name", "PrimaryId", "TeamNum", "Score", "Goal
 /// Since 0.7.0, after `CrossbarHits` so that the older fields keep their place; what the events counted follows them.
 const ACTION_FIELDS: [&str; 3] = ["Shots", "Touches", "CarTouches"];
 const TEAM_FIELDS: [&str; 3] = ["Name", "TeamNum", "Score"];
-const DEPARTURE_FIELDS: [&str; 21] = [
+const DEPARTURE_FIELDS: [&str; 26] = [
     "PrimaryId",
     "Name",
     "TeamNum",
@@ -883,6 +1057,11 @@ const DEPARTURE_FIELDS: [&str; 21] = [
     "LongestGoal",
     "QuickestGoal",
     "HardestHit",
+    "AerialTouches",
+    "DefensiveTouches",
+    "OffensiveTouches",
+    "Possession",
+    "Car",
 ];
 
 fn pick(source: &Value, keys: &[&str]) -> Value {
@@ -1917,6 +2096,103 @@ mod tests {
         )
     }
 
+    /// One update of play in the match "cars": the first player's car as `car` says, the second's demolished... out of
+    /// sight with `bHasCar` false, the opponents' out of sight, and the ball last touched by `ball`.
+    fn car_update(car: Value, ball: u64, replay: bool) -> Value {
+        let mut state = payload("cars")["state"].clone();
+        for (index, player) in state["Players"].as_array_mut().unwrap().iter_mut().enumerate() {
+            player["Shortcut"] = json!(index % 3);
+            match index {
+                0 => {
+                    for (key, value) in car.as_object().unwrap() {
+                        player[key] = value.clone();
+                    }
+                    player["bHasCar"] = json!(true);
+                }
+                1 => player["bHasCar"] = json!(false),
+                _ => {}
+            }
+        }
+        state["Game"]["Ball"] = json!({ "Speed": 0, "TeamNum": ball });
+        state["Game"]["bReplay"] = json!(replay);
+        packet("UpdateState", state)
+    }
+
+    fn high_hit(players: Value, y: f64, z: f64) -> Value {
+        let mut hit = hit(json!(1000), players, 0.0, y);
+        hit["Data"]["Ball"]["Location"]["Z"] = json!(z);
+        hit
+    }
+
+    #[test]
+    fn follows_the_cars_the_game_shows_and_the_ball_during_play_only() {
+        let guid = "cars";
+        let mut capture = MatchCapture::default();
+        let mut received = Vec::new();
+        let messages = [
+            packet("MatchCreated", json!({})),
+            event("CountdownBegin"),
+            // Before the kickoff, the cars wait: nothing counts.
+            car_update(json!({ "Boost": 33 }), 255, false),
+            event("RoundStarted"),
+            // Each car starts the round with 33 boost: no pickup. Nobody touched the ball yet: no possession.
+            car_update(json!({ "Boost": 33, "bOnGround": true }), 255, false),
+            // A small pad, then a big one at full speed.
+            car_update(json!({ "Boost": 45, "bOnGround": true }), 0, false),
+            car_update(json!({ "Boost": 100, "bSupersonic": true, "bBoosting": true }), 0, false),
+            // One powerslide over two updates.
+            car_update(json!({ "Boost": 80, "bOnGround": true, "bPowersliding": true }), 1, false),
+            car_update(json!({ "Boost": 80, "bOnGround": true, "bPowersliding": true }), 1, false),
+            // Demolished: off the pitch, then back with 33 boost, which no pad gave.
+            car_update(json!({ "Boost": 80, "bDemolished": true }), 1, false),
+            car_update(json!({ "Boost": 33, "bOnWall": true }), 1, false),
+            high_hit(json!([target(0, 0)]), -3000.0, 93.0),
+            high_hit(json!([target(0, 0)]), 3000.0, 500.0),
+            high_hit(json!([target(0, 1)]), -3000.0, 93.0),
+            goal(90.0, target(0, 0), 5150.0),
+            // The goal replay: nothing counts, nor the touches it sends again.
+            car_update(json!({ "Boost": 100 }), 0, true),
+            high_hit(json!([target(0, 0)]), 3000.0, 500.0),
+            event("CountdownBegin"),
+            event("RoundStarted"),
+            car_update(json!({ "Boost": 33 }), 255, false),
+            // An empty tank comes without its boost.
+            car_update(json!({}), 0, false),
+            event("MatchEnded"),
+            car_update(json!({ "Boost": 100 }), 0, false),
+            car_update(json!({ "Boost": 100 }), 0, false),
+        ];
+        for message in messages {
+            let mut message = message.clone();
+            message["Data"]["MatchGuid"] = json!(guid);
+            if message["Event"] == "MatchEnded" {
+                message["Data"]["WinnerTeamNum"] = json!(1);
+            }
+            received.extend(capture.handle(&message, NOW));
+        }
+        assert_eq!(received.len(), 1);
+        assert_eq!(check_live_match(&received[0], NOW), Ok(()));
+        let players = received[0]["state"]["Players"].as_array().unwrap();
+        assert_eq!(
+            players[0]["Car"],
+            json!({ "Samples": 8, "BoostSum": 404, "NoBoost": 1, "FullBoost": 1, "Supersonic": 1, "OnGround": 4,
+                    "OnWall": 1, "Boosting": 1, "Powerslides": 1, "Pickups": 2, "BigPickups": 1,
+                    "BoostCollected": 67 })
+        );
+        // A car out of sight, demolished or the opponents', has no line of its own.
+        assert_eq!(players[1].get("Car"), None);
+        assert_eq!(players[3].get("Car"), None);
+        // Seven updates of play after a touch: the blue team had the ball in three of them, the orange one in four.
+        assert_eq!(players[0]["Possession"], json!({ "Samples": 7, "Owned": 3 }));
+        assert_eq!(players[3]["Possession"], json!({ "Samples": 7, "Owned": 4 }));
+        let touches = |player: &Value| {
+            [&player["AerialTouches"], &player["DefensiveTouches"], &player["OffensiveTouches"]].map(Value::clone)
+        };
+        assert_eq!(touches(&players[0]), [json!(1), json!(1), json!(1)]);
+        // Blue's goal is orange's attack.
+        assert_eq!(touches(&players[3]), [json!(0), json!(0), json!(1)]);
+    }
+
     #[test]
     fn sends_the_shots_and_touches_the_game_gives() {
         let p = payload("touches");
@@ -2120,13 +2396,14 @@ mod tests {
     }
 
     /// A 4v4 seen with sixteen players, half of whom left, every one with as much counted as the capture keeps:
-    /// thirty stat feed names earned and suffered, three-digit counts, an assist, a goal and a hit.
+    /// thirty stat feed names earned and suffered, three-digit counts, an assist, a goal, a hit and a car followed.
     fn heaviest_match(player: impl Fn(usize) -> Value) -> Value {
         let mut state = payload("heavy")["state"].clone();
         state["Game"]["PlaylistId"] = json!(4);
         state["Game"]["TimeSeconds"] = json!(300);
         state["Game"]["bOvertime"] = json!(false);
         state["Game"]["Arena"] = json!("a".repeat(MAX_ARENA));
+        state["Game"]["Ball"] = json!({ "Speed": 0, "TeamNum": 0 });
         let mut capture = MatchCapture::default();
         let mut received = Vec::new();
         let mut send = |capture: &mut MatchCapture, mut message: Value| {
@@ -2143,6 +2420,7 @@ mod tests {
                 let team = me % 2;
                 let y = if team == 0 { 5150.0 } else { -5150.0 };
                 send(&mut capture, event("RoundStarted"));
+                send(&mut capture, packet("UpdateState", state.clone()));
                 send(&mut capture, hit(json!(1_234.567_890_123_4), json!([target(me, team)]), -4096.0, -y));
                 let mut scored = goal(123.456_789_012_34, target(me, team), y);
                 scored["Data"]["GoalTime"] = json!(123.456_789_012_34);
@@ -2171,7 +2449,9 @@ mod tests {
 
     fn statistics(index: usize) -> Value {
         json!({ "Shortcut": index, "TeamNum": index % 2, "Score": 999_999, "Goals": 999_999, "Shots": 999_999,
-                "Assists": 999_999, "Saves": 999_999, "Touches": 999_999, "CarTouches": 999_999, "Demos": 999_999 })
+                "Assists": 999_999, "Saves": 999_999, "Touches": 999_999, "CarTouches": 999_999, "Demos": 999_999,
+                "bHasCar": true, "Boost": 100, "bOnGround": true, "bOnWall": true, "bSupersonic": true,
+                "bBoosting": true, "bPowersliding": true })
     }
 
     #[test]
@@ -2188,6 +2468,9 @@ mod tests {
             assert_eq!(player["StatfeedSecondary"].as_object().unwrap().len(), MAX_STATFEED_NAMES);
             assert_eq!(player["AssistsTo"].as_object().unwrap().len(), 1);
             assert_eq!(player["LongestGoal"], 11057);
+            assert!(player["Car"]["Samples"].as_u64().unwrap() > 0);
+            assert!(player["Possession"]["Samples"].as_u64().unwrap() > 0);
+            assert_eq!(player["DefensiveTouches"], 1);
         }
         assert_eq!(sent["state"]["Game"]["StatfeedLabels"].as_object().unwrap().len(), MAX_STATFEED_NAMES);
     }
